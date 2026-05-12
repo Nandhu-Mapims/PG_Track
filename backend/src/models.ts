@@ -179,10 +179,13 @@ const auditLogSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: "User" },
     username: String,
+    patientRef: String,
     action: String,
     module: String,
     method: String,
     path: String,
+    status: { type: String, enum: ["Success", "Failed"], default: "Success" },
+    statusCode: Number,
     ipAddress: String,
     meta: Schema.Types.Mixed,
   },

@@ -1,7 +1,25 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
 body {
   margin: 0;
-  font-family: Inter, "Segoe UI", Arial, sans-serif;
-  background: #f8fafc;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #eef2f6;
+  background-image:
+    radial-gradient(ellipse 120% 80% at 0% -20%, rgb(20 184 166 / 0.12), transparent 50%),
+    radial-gradient(ellipse 80% 60% at 100% 0%, rgb(14 116 144 / 0.1), transparent 45%),
+    linear-gradient(180deg, #f1f5f9 0%, #eef2f6 40%, #e8edf3 100%);
+  min-height: 100vh;
+  color: #0f172a;
+}
+
+/* Focus ring for accessibility */
+:focus-visible {
+  outline: 2px solid rgb(13 148 136);
+  outline-offset: 2px;
 }
