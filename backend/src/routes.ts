@@ -20,14 +20,37 @@ import {
   toObjectId,
 } from "./models";
 import { AuthRequest, auditLogger, authMiddleware, requireAssignmentManager, requireRoles, signToken } from "./middleware";
+import { registerHisRoutes } from "./hisRoutes";
+import { resolveDepartmentFromHis } from "./hisDepartmentResolve";
+import {
+  getCompletedCasesForPg,
+  getCompletedCasesGroupedByPg,
+  isDemoPatientRecord,
+} from "./completedCasesService";
+import { syncDischargesFromHis, syncDischargesFromHisIfDue } from "./hisDischargeSync";
+import { hisEnv } from "./hisEnv";
+import { fetchPatDetailsFromEmr, isEmrZPatientRow } from "./hisQueryBuilder";
+import {
+  drawPgActivityPageFooters,
+  formatReportDateRange,
+  formatTimelineWhen,
+  renderPgActivityReportPdf,
+} from "./pgActivityPdf";
 
 export const apiRouter = Router();
+registerHisRoutes(apiRouter);
 
 function normalizeDate(value?: string) {
   if (!value) return null;
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
 }
+
+function includeInactiveMaster(req: Request): boolean {
+  return req.query.includeInactive === "true" || req.query.includeInactive === "1";
+}
+
+const masterActiveOnly = { status: { $ne: "Inactive" as const } };
 
 function normalizeShift(value?: string): "Morning" | "Evening" | "Night" | "General" {
   if (value === "Morning" || value === "Evening" || value === "Night" || value === "General") return value;
@@ -86,6 +109,44 @@ function groupPgActivityByPatient(rows: PgActivityFormattedRow[]): PgActivityPat
     .sort((a, b) => a.patient.localeCompare(b.patient, undefined, { sensitivity: "base" }));
 }
 
+function duplicateKeyMessage(
+  entity: "Department" | "Unit" | "Activity type",
+  err: unknown,
+): string | null {
+  const maybeDup = err as {
+    code?: number;
+    keyPattern?: Record<string, number>;
+    keyValue?: Record<string, unknown>;
+  };
+  if (maybeDup?.code !== 11000) return null;
+
+  if (entity === "Department") {
+    if (maybeDup.keyPattern?.code) {
+      return `Department code "${String(maybeDup.keyValue?.code || "")}" already exists. Use a different code.`;
+    }
+    if (maybeDup.keyPattern?.name) {
+      return `Department name "${String(maybeDup.keyValue?.name || "")}" already exists.`;
+    }
+    return "Department already exists with the same details.";
+  }
+
+  if (entity === "Unit") {
+    if (maybeDup.keyPattern?.name && maybeDup.keyPattern?.departmentId) {
+      return `Unit "${String(maybeDup.keyValue?.name || "")}" already exists in this department.`;
+    }
+    return "Unit already exists with the same details.";
+  }
+
+  if (entity === "Activity type") {
+    if (maybeDup.keyPattern?.name) {
+      return `Activity type "${String(maybeDup.keyValue?.name || "")}" already exists.`;
+    }
+    return "Activity type already exists with the same details.";
+  }
+
+  return null;
+}
+
 apiRouter.post("/auth/login", async (req: Request, res: Response) => {
   const { username, password } = req.body as { username: string; password: string };
   const user = await User.findOne({ username });
@@ -107,8 +168,26 @@ apiRouter.get("/auth/profile", authMiddleware, async (req: AuthRequest, res: Res
 });
 
 apiRouter.get("/pg", authMiddleware, async (_req, res) => {
-  const data = await User.find({ role: "PG" }).populate("departmentId unitId");
-  res.json(data);
+  const users = await User.find({ role: "PG", status: "Active" })
+    .populate("departmentId unitId")
+    .sort({ fullName: 1 })
+    .lean();
+  const userIds = users.map((user: any) => user._id);
+  const pgMasters = userIds.length > 0
+    ? await PGMaster.find({ userId: { $in: userIds } }).select("userId yearOfResidency joiningDate").lean()
+    : [];
+  const pgMasterByUserId = new Map(
+    pgMasters.map((row: any) => [
+      String(row.userId),
+      { yearOfResidency: row.yearOfResidency, joiningDate: row.joiningDate },
+    ]),
+  );
+  res.json(
+    users.map((user: any) => ({
+      ...user,
+      ...(pgMasterByUserId.get(String(user._id)) || {}),
+    })),
+  );
 });
 apiRouter.post("/pg", authMiddleware, requireRoles("Admin"), auditLogger("PGMaster", "Create PG"), async (req, res) => {
   const user = await User.create({ ...req.body, role: "PG" });
@@ -128,24 +207,167 @@ apiRouter.delete("/pg/:id", authMiddleware, requireRoles("Admin"), auditLogger("
   res.json(user);
 });
 
-apiRouter.get("/departments", authMiddleware, async (_req, res) => res.json(await Department.find()));
-apiRouter.post("/departments", authMiddleware, requireRoles("Admin"), auditLogger("Department", "Create Department"), async (req, res) => {
-  res.status(201).json(await Department.create(req.body));
+apiRouter.get("/departments", authMiddleware, async (req, res) => {
+  const filter = includeInactiveMaster(req) ? {} : masterActiveOnly;
+  res.json(await Department.find(filter).sort({ name: 1 }));
 });
-apiRouter.get("/units", authMiddleware, async (_req, res) => res.json(await Unit.find().populate("departmentId consultantId")));
-apiRouter.post("/units", authMiddleware, requireRoles("Admin"), auditLogger("Unit", "Create Unit"), async (req, res) => {
-  res.status(201).json(await Unit.create(req.body));
+apiRouter.post(
+  "/departments/resolve-from-his",
+  authMiddleware,
+  auditLogger("Department", "ResolveFromHIS"),
+  async (req, res) => {
+    const { dept_name, dept_id } = req.body as { dept_name?: string; dept_id?: string };
+    try {
+      const dept = await resolveDepartmentFromHis(String(dept_name ?? ""), String(dept_id ?? ""));
+      if (!dept) {
+        return res.status(400).json({ message: "Provide HIS department name and/or HIS department id." });
+      }
+      return res.json({ departmentId: String(dept._id), name: dept.name, code: dept.code });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Department resolve failed";
+      return res.status(500).json({ message });
+    }
+  },
+);
+apiRouter.post("/departments", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("Department", "Create Department"), async (req, res) => {
+  try {
+    res.status(201).json(await Department.create(req.body));
+  } catch (err: unknown) {
+    const message = duplicateKeyMessage("Department", err);
+    if (message) return res.status(409).json({ message });
+    return res.status(500).json({ message: "Could not create department." });
+  }
 });
-apiRouter.get("/activity-types", authMiddleware, async (_req, res) => res.json(await ActivityType.find()));
-apiRouter.post("/activity-types", authMiddleware, requireRoles("Admin"), async (req, res) => {
-  res.status(201).json(await ActivityType.create(req.body));
+apiRouter.put("/departments/:id", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("Department", "Update Department"), async (req, res) => {
+  try {
+    const row = await Department.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!row) return res.status(404).json({ message: "Department not found" });
+    return res.json(row);
+  } catch (err: unknown) {
+    const message = duplicateKeyMessage("Department", err);
+    if (message) return res.status(409).json({ message });
+    return res.status(500).json({ message: "Could not update department." });
+  }
+});
+apiRouter.patch("/departments/:id/status", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("Department", "Set Department Status"), async (req, res) => {
+  const status = req.body?.status === "Inactive" ? "Inactive" : "Active";
+  const row = await Department.findByIdAndUpdate(req.params.id, { status }, { new: true });
+  if (!row) return res.status(404).json({ message: "Department not found" });
+  res.json(row);
+});
+apiRouter.get("/units", authMiddleware, async (req, res) => {
+  const filter = includeInactiveMaster(req) ? {} : masterActiveOnly;
+  res.json(await Unit.find(filter).populate("departmentId consultantId").sort({ name: 1 }));
+});
+apiRouter.post("/units", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("Unit", "Create Unit"), async (req, res) => {
+  try {
+    res.status(201).json(await Unit.create(req.body));
+  } catch (err: unknown) {
+    const message = duplicateKeyMessage("Unit", err);
+    if (message) return res.status(409).json({ message });
+    return res.status(500).json({ message: "Could not create unit." });
+  }
+});
+apiRouter.put("/units/:id", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("Unit", "Update Unit"), async (req, res) => {
+  try {
+    const row = await Unit.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true }).populate("departmentId consultantId");
+    if (!row) return res.status(404).json({ message: "Unit not found" });
+    return res.json(row);
+  } catch (err: unknown) {
+    const message = duplicateKeyMessage("Unit", err);
+    if (message) return res.status(409).json({ message });
+    return res.status(500).json({ message: "Could not update unit." });
+  }
+});
+apiRouter.patch("/units/:id/status", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("Unit", "Set Unit Status"), async (req, res) => {
+  const status = req.body?.status === "Inactive" ? "Inactive" : "Active";
+  const row = await Unit.findByIdAndUpdate(req.params.id, { status }, { new: true }).populate("departmentId consultantId");
+  if (!row) return res.status(404).json({ message: "Unit not found" });
+  res.json(row);
+});
+apiRouter.get("/activity-types", authMiddleware, async (req, res) => {
+  const filter = includeInactiveMaster(req) ? {} : masterActiveOnly;
+  res.json(await ActivityType.find(filter).sort({ name: 1 }));
+});
+apiRouter.post("/activity-types", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("ActivityType", "Create Activity Type"), async (req, res) => {
+  try {
+    res.status(201).json(await ActivityType.create(req.body));
+  } catch (err: unknown) {
+    const message = duplicateKeyMessage("Activity type", err);
+    if (message) return res.status(409).json({ message });
+    return res.status(500).json({ message: "Could not create activity type." });
+  }
+});
+apiRouter.put("/activity-types/:id", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("ActivityType", "Update Activity Type"), async (req, res) => {
+  try {
+    const row = await ActivityType.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!row) return res.status(404).json({ message: "Activity type not found" });
+    return res.json(row);
+  } catch (err: unknown) {
+    const message = duplicateKeyMessage("Activity type", err);
+    if (message) return res.status(409).json({ message });
+    return res.status(500).json({ message: "Could not update activity type." });
+  }
+});
+apiRouter.patch("/activity-types/:id/status", authMiddleware, requireRoles("Admin", "HOD"), auditLogger("ActivityType", "Set Activity Type Status"), async (req, res) => {
+  const status = req.body?.status === "Inactive" ? "Inactive" : "Active";
+  const row = await ActivityType.findByIdAndUpdate(req.params.id, { status }, { new: true });
+  if (!row) return res.status(404).json({ message: "Activity type not found" });
+  res.json(row);
 });
 
 apiRouter.post("/admission", authMiddleware, auditLogger("Admission", "Create Admission"), async (req, res) => {
-  const { patient, admission } = req.body as { patient: Record<string, unknown>; admission: any };
+  const { patient, admission, his_dept_name, his_dept_id } = req.body as {
+    patient: Record<string, unknown>;
+    admission: any;
+    his_dept_name?: string;
+    his_dept_id?: string;
+  };
+
+  const ipNumber = String(patient?.ipNumber ?? "").trim();
+  if (ipNumber && hisEnv.enabled && hisEnv.queryBuilderConfigured) {
+    const to = new Date();
+    const from = new Date(to);
+    from.setFullYear(from.getFullYear() - 2);
+    const hisRows = await fetchPatDetailsFromEmr(from, to, {
+      ipno: ipNumber,
+      optoip: "0",
+      includeZPatients: true,
+    });
+    if (hisRows.some(isEmrZPatientRow)) {
+      return res.status(400).json({
+        message: "Z-patients cannot be admitted to PG tracking.",
+      });
+    }
+  }
+
   let patientDoc = await Patient.findOne({ ipNumber: patient.ipNumber });
   if (!patientDoc) patientDoc = await Patient.create(patient);
-  const admissionDoc = await Admission.create({ ...admission, patientId: patientDoc._id });
+
+  let departmentId = admission?.departmentId;
+  if (departmentId != null && String(departmentId).trim() === "") {
+    departmentId = undefined;
+  }
+  const hisName = String(his_dept_name ?? admission?.his_dept_name ?? "").trim();
+  const hisId = String(his_dept_id ?? admission?.his_dept_id ?? "").trim();
+  if (!departmentId && (hisName || hisId)) {
+    const resolved = await resolveDepartmentFromHis(hisName, hisId);
+    if (resolved) departmentId = String(resolved._id);
+  }
+  if (!departmentId) {
+    return res.status(400).json({
+      message: "Department is required. Pick a HIS patient row to auto-map department, or choose department manually.",
+    });
+  }
+
+  const departmentDoc = await Department.findById(departmentId);
+  if (!departmentDoc || departmentDoc.status === "Inactive") {
+    return res.status(400).json({
+      message: "Selected department is inactive. Choose an active department from Master Data or map from HIS again.",
+    });
+  }
+
+  const admissionDoc = await Admission.create({ ...admission, patientId: patientDoc._id, departmentId });
   if (admission.assignedPgId) {
     await PatientAssignment.create({
       admissionId: admissionDoc._id,
@@ -304,6 +526,31 @@ apiRouter.get("/dashboard/pg/:pgId", authMiddleware, async (req, res) => {
   });
 });
 
+apiRouter.get("/dashboard/pg/:pgId/completed-cases", authMiddleware, async (req, res) => {
+  try {
+    const rows = await getCompletedCasesForPg(String(req.params.pgId));
+    return res.json(rows);
+  } catch (err) {
+    console.warn("completed-cases failed", err);
+    return res.status(500).json({ message: "Unable to load completed cases" });
+  }
+});
+
+apiRouter.get(
+  "/dashboard/completed-cases-by-pg",
+  authMiddleware,
+  requireRoles("Admin", "HOD"),
+  async (_req, res) => {
+    try {
+      const groups = await getCompletedCasesGroupedByPg();
+      return res.json(groups);
+    } catch (err) {
+      console.warn("completed-cases-by-pg failed", err);
+      return res.status(500).json({ message: "Unable to load completed cases by PG" });
+    }
+  },
+);
+
 apiRouter.get("/dashboard/hod", authMiddleware, requireRoles("HOD", "Admin"), async (_req, res) => {
   const today = localDayRange(0);
   const yesterday = localDayRange(-1);
@@ -365,15 +612,63 @@ apiRouter.get("/dashboard/admin", authMiddleware, requireRoles("Admin"), async (
 });
 
 apiRouter.get("/analytics/overview", authMiddleware, async (_req, res) => {
-  const [casesPerMonth, activityPerPg, proceduresByRole] = await Promise.all([
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const trendStart = new Date(today);
+  trendStart.setDate(trendStart.getDate() - 6);
+  const trendDays = Array.from({ length: 7 }, (_v, index) => {
+    const d = new Date(trendStart);
+    d.setDate(trendStart.getDate() + index);
+    return {
+      key: d.toISOString().slice(0, 10),
+      label: d.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+    };
+  });
+
+  const [casesPerMonth, activityPerPg, proceduresByRole, admissionsByDay, activitiesByDay, departmentCounts, icuRows, departments] = await Promise.all([
     Admission.aggregate([
       { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$admissionDate" } }, cases: { $sum: 1 } } },
       { $sort: { _id: 1 } },
     ]),
     PGActivityLog.aggregate([{ $group: { _id: "$pgId", count: { $sum: 1 } } }, { $sort: { count: -1 } }]),
     Procedure.aggregate([{ $group: { _id: "$role", count: { $sum: 1 } } }, { $sort: { count: -1 } }]),
+    Admission.aggregate([
+      { $match: { admissionDate: { $gte: trendStart } } },
+      { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$admissionDate" } }, value: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]),
+    PGActivityLog.aggregate([
+      { $match: { createdAt: { $gte: trendStart } } },
+      { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, value: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]),
+    Admission.aggregate([
+      { $match: { status: "Admitted" } },
+      { $group: { _id: "$departmentId", value: { $sum: 1 } } },
+      { $sort: { value: -1 } },
+    ]),
+    PatientAssignment.aggregate([
+      { $match: { isActive: true, icuTag: true } },
+      { $group: { _id: "$patientId" } },
+      { $count: "value" },
+    ]),
+    Department.find().select("name").lean(),
   ]);
-  res.json({ casesPerMonth, activityPerPg, proceduresByRole });
+  const admissionsByDayMap = new Map(admissionsByDay.map((row) => [String(row._id), Number(row.value) || 0]));
+  const activitiesByDayMap = new Map(activitiesByDay.map((row) => [String(row._id), Number(row.value) || 0]));
+  const departmentMap = new Map(departments.map((dept) => [String(dept._id), dept.name]));
+  const admissionsTrend = trendDays.map((day) => ({ label: day.label, value: admissionsByDayMap.get(day.key) || 0 }));
+  const pgActivityTrend = trendDays.map((day) => ({ label: day.label, value: activitiesByDayMap.get(day.key) || 0 }));
+  const departmentLoad = departmentCounts.map((row) => ({
+    label: departmentMap.get(String(row._id)) || "Unknown",
+    value: Number(row.value) || 0,
+  }));
+  const icuLoad = Number(icuRows[0]?.value) || 0;
+  if (icuLoad > 0) {
+    departmentLoad.push({ label: "ICU", value: icuLoad });
+  }
+  departmentLoad.sort((a, b) => b.value - a.value);
+  res.json({ casesPerMonth, activityPerPg, proceduresByRole, admissionsTrend, pgActivityTrend, departmentLoad });
 });
 
 apiRouter.post("/assignments", authMiddleware, requireAssignmentManager, auditLogger("Assignment", "Create Assignment"), async (req: AuthRequest, res) => {
@@ -456,7 +751,19 @@ apiRouter.get("/assignments/history/:patientId", authMiddleware, async (req, res
 });
 
 apiRouter.get("/assignments/live-board", authMiddleware, async (_req, res) => {
-  const admissions = await Admission.find({ status: "Admitted" }).populate("patientId unitId consultantId").lean();
+  try {
+    await syncDischargesFromHisIfDue();
+  } catch (err) {
+    console.warn("HIS discharge sync skipped for live-board", err);
+  }
+
+  const admissionsRaw = await Admission.find({ status: "Admitted" })
+    .populate("patientId departmentId unitId consultantId")
+    .lean();
+  const admissions = admissionsRaw.filter((a) => {
+    const patient = a.patientId as { patientName?: string; ipNumber?: string } | null;
+    return !isDemoPatientRecord(patient?.ipNumber, patient?.patientName);
+  });
   const patientIds = admissions.map((a) => String(a.patientId?._id || a.patientId));
 
   const [assignments, lastActivities] = await Promise.all([
@@ -492,6 +799,9 @@ apiRouter.get("/assignments/live-board", authMiddleware, async (_req, res) => {
       patientId,
       patientName: (a.patientId as any)?.patientName,
       ipNumber: (a.patientId as any)?.ipNumber,
+      wardBedNumber: a.wardBedNumber || null,
+      department: (a.departmentId as any)?.name || null,
+      admissionDate: a.admissionDate || null,
       unit: (a.unitId as any)?.name || null,
       consultant: (a.consultantId as any)?.fullName || null,
       assignedPgs: activeAssignments.map((x) => ({
@@ -502,6 +812,7 @@ apiRouter.get("/assignments/live-board", authMiddleware, async (_req, res) => {
       })),
       lastActivityAt,
       hoursSinceReview,
+      isIcu: hasIcu || Boolean(a.icuTag),
       status,
     };
   });
@@ -601,9 +912,15 @@ apiRouter.get("/reports/pg-activity", authMiddleware, async (req, res) => {
   const activityTypeId = typeof req.query.activityTypeId === "string" ? req.query.activityTypeId.trim() : "";
 
   const [selectedPg, selectedActivityType] = await Promise.all([
-    pgId ? User.findById(pgId).select("fullName username").lean() : Promise.resolve(null),
+    pgId ? User.findById(pgId).select("fullName username departmentId").lean() : Promise.resolve(null),
     activityTypeId ? ActivityType.findById(activityTypeId).select("name").lean() : Promise.resolve(null),
   ]);
+
+  let reportDepartmentName = "All departments";
+  if (selectedPg?.departmentId) {
+    const pgDept = await Department.findById(selectedPg.departmentId).select("name").lean();
+    if (pgDept?.name) reportDepartmentName = String(pgDept.name);
+  }
   const filterSummary = [
     from ? `From: ${from}` : "From: Any",
     to ? `To: ${to}` : "To: Any",
@@ -727,7 +1044,7 @@ apiRouter.get("/reports/pg-activity", authMiddleware, async (req, res) => {
       { key: "dateTime", width: 24 },
       { key: "patient", width: 26 },
       { key: "ipNumber", width: 18 },
-      { key: "department", width: 22 },
+      { key: "department", width: 30 },
       { key: "unit", width: 22 },
       { key: "pg", width: 24 },
       { key: "activity", width: 24 },
@@ -818,6 +1135,8 @@ apiRouter.get("/reports/pg-activity", authMiddleware, async (req, res) => {
               bottom: { style: "thin", color: { argb: "FFE2E8F0" } },
             };
           });
+          const deptCell = dataRow.getCell("department");
+          deptCell.alignment = { vertical: "middle", horizontal: "left", wrapText: false };
         }
       }
     }
@@ -828,175 +1147,40 @@ apiRouter.get("/reports/pg-activity", authMiddleware, async (req, res) => {
     return res.end();
   }
   if (format === "pdf") {
-    const doc = new PDFDocument({ margin: 28, size: "A4" });
+    const generatedAt = new Date();
+    const doc = new PDFDocument({ margin: 28, size: "A4", bufferPages: true });
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", "attachment; filename=pg-activity-report.pdf");
     doc.pipe(res);
 
-    doc.fontSize(16).text("PG Activity Report", { align: "left" });
-    doc.moveDown(0.2);
-    doc.fontSize(9).fillColor("#475569").text(`Filters: ${filterSummary}`);
-    doc.fillColor("#000000");
-    doc.moveDown(0.5);
+    const reportPgName = selectedPg
+      ? String(selectedPg.fullName || selectedPg.username || "PG")
+      : "All PGs";
 
-    const x = { dt: 28, patient: 110, dept: 194, unit: 252, pg: 310, activity: 362, ip: 408 };
-    const w = { dt: 82, patient: 84, dept: 58, unit: 58, pg: 52, activity: 46, ip: 56 };
-    const tableLeft = 28;
-    const tableRight = 565;
-    const tableWidth = tableRight - tableLeft;
-    const headerBandPad = 6;
-    const headerLabelBaseline = 11;
-    const headerRowHeight = 14;
-    const rowLineGap = 1;
-    const rowPaddingBottom = 6;
-    const rowPadTop = 6;
-    const rowPadBottom = 7;
-    const borderHair = 0.35;
-    const pageBottom = doc.page.height - 48;
-    const colors = {
-      headerBg: "#e2e8f0",
-      headerText: "#0f172a",
-      headerRule: "#94a3b8",
-      rowOdd: "#ffffff",
-      rowEven: "#f8fafc",
-      bodyText: "#334155",
-      rowRule: "#e2e8f0",
-    };
-
-    const pdfActivityRowHeight = (r: PgActivityFormattedRow) => {
-      doc.fontSize(8.5).font("Helvetica");
-      const cells = [
-        String(r.dateTime),
-        String(r.patient),
-        String(r.department),
-        String(r.unit),
-        String(r.pg),
-        String(r.activity),
-        String(r.ipNumber),
-      ];
-      const widths = [w.dt, w.patient, w.dept, w.unit, w.pg, w.activity, w.ip];
-      let maxH = 11;
-      for (let i = 0; i < cells.length; i++) {
-        const h = doc.heightOfString(cells[i], { width: widths[i], lineGap: rowLineGap });
-        maxH = Math.max(maxH, h);
-      }
-      return Math.ceil(maxH) + rowPaddingBottom;
-    };
-
-    const patientBannerOuter = 34;
-
-    const drawHeader = () => {
-      const headerTop = doc.y;
-      const bandH = headerBandPad * 2 + headerRowHeight;
-      doc.save();
-      doc.rect(tableLeft, headerTop, tableWidth, bandH).fill(colors.headerBg);
-      doc.restore();
-
-      const headerTextY = headerTop + headerBandPad + headerLabelBaseline;
-      doc.fontSize(9).font("Helvetica-Bold").fillColor(colors.headerText);
-      doc.text("Date & Time", x.dt, headerTextY, { width: w.dt, lineBreak: false });
-      doc.text("Patient", x.patient, headerTextY, { width: w.patient, lineBreak: false });
-      doc.text("Department", x.dept, headerTextY, { width: w.dept, lineBreak: false });
-      doc.text("Unit", x.unit, headerTextY, { width: w.unit, lineBreak: false });
-      doc.text("PG", x.pg, headerTextY, { width: w.pg, lineBreak: false });
-      doc.text("Activity", x.activity, headerTextY, { width: w.activity, lineBreak: false });
-      doc.text("IP", x.ip, headerTextY, { width: w.ip, lineBreak: false });
-
-      const headerBottom = headerTop + bandH;
-      doc.save();
-      doc.lineWidth(borderHair + 0.15);
-      doc.moveTo(tableLeft, headerBottom).lineTo(tableRight, headerBottom).strokeColor(colors.headerRule).stroke();
-      doc.restore();
-
-      doc.y = headerBottom + 8;
-      doc.font("Helvetica").fillColor(colors.bodyText);
-    };
-
-    const drawPatientBanner = (patient: string, ip: string) => {
-      if (doc.y + patientBannerOuter > pageBottom) {
-        doc.addPage();
-        drawHeader();
-      }
-      const top = doc.y;
-      doc.fontSize(10).font("Helvetica-Bold").fillColor(colors.headerText);
-      doc.text(`Patient: ${patient}    •    IP: ${ip}`, tableLeft, top + 4, { width: tableWidth });
-      const ruleY = top + 22;
-      doc.save();
-      doc.lineWidth(borderHair + 0.2);
-      doc.moveTo(tableLeft, ruleY).lineTo(tableRight, ruleY).strokeColor(colors.headerRule).stroke();
-      doc.restore();
-      doc.y = ruleY + 10;
-      doc.font("Helvetica").fillColor(colors.bodyText);
-    };
-
-    drawHeader();
-    if (formattedRows.length === 0) {
-      const message = "No records found for selected filters.";
-      const messageWidth = 260;
-      const xPos = (doc.page.width - messageWidth) / 2;
-      const yPos = doc.page.height / 2 - 10;
-      doc.fontSize(12).fillColor("#64748b").text(message, xPos, yPos, {
-        width: messageWidth,
-        align: "center",
-      });
-      doc.fillColor("#000000");
-      doc.end();
-      return;
-    }
-
-    const maxPdfActivities = 120;
-    let pdfActivitiesDrawn = 0;
-
-    for (const g of activityGroups) {
-      if (pdfActivitiesDrawn >= maxPdfActivities) break;
-
-      drawPatientBanner(g.patient, g.ipNumber);
-
-      let pdfRowIndex = 0;
-      for (const r of g.rows) {
-        if (pdfActivitiesDrawn >= maxPdfActivities) break;
-
-        const rowForPdf: PgActivityFormattedRow = { ...r, patient: "" };
-        const contentH = pdfActivityRowHeight(rowForPdf);
-        const totalRowH = rowPadTop + contentH + rowPadBottom;
-        if (doc.y + totalRowH > pageBottom) {
-          doc.addPage();
-          drawHeader();
-          drawPatientBanner(g.patient, g.ipNumber);
-        }
-
-        const rowTop = doc.y;
-        const zebra = pdfRowIndex % 2 === 1;
-        doc.save();
-        doc.rect(tableLeft, rowTop, tableWidth, totalRowH).fill(zebra ? colors.rowEven : colors.rowOdd);
-        doc.restore();
-
-        const contentTop = rowTop + rowPadTop;
-        doc.fontSize(8.5).font("Helvetica").fillColor(colors.bodyText);
-        const placeCell = (text: string, colX: number, colW: number) => {
-          doc.text(String(text), colX, contentTop, { width: colW, lineGap: rowLineGap });
-          doc.y = contentTop;
-        };
-        placeCell(r.dateTime, x.dt, w.dt);
-        placeCell("", x.patient, w.patient);
-        placeCell(r.department, x.dept, w.dept);
-        placeCell(r.unit, x.unit, w.unit);
-        placeCell(r.pg, x.pg, w.pg);
-        placeCell(r.activity, x.activity, w.activity);
-        placeCell(r.ipNumber, x.ip, w.ip);
-
-        const ruleY = rowTop + totalRowH;
-        doc.save();
-        doc.lineWidth(borderHair);
-        doc.moveTo(tableLeft, ruleY).lineTo(tableRight, ruleY).strokeColor(colors.rowRule).stroke();
-        doc.restore();
-
-        doc.y = ruleY + 5;
-        doc.fillColor(colors.bodyText);
-        pdfRowIndex += 1;
-        pdfActivitiesDrawn += 1;
-      }
-    }
+    renderPgActivityReportPdf(doc, {
+      generatedAt,
+      meta: {
+        pgName: reportPgName,
+        departmentName: reportDepartmentName,
+        dateRangeLabel: formatReportDateRange(from, to),
+        activityTypeFilter: selectedActivityType?.name
+          ? String(selectedActivityType.name)
+          : undefined,
+      },
+      groups: activityGroups.map((g) => ({
+        patient: g.patient,
+        ipNumber: g.ipNumber,
+        department: g.rows[0]?.department && g.rows[0].department !== "—" ? g.rows[0].department : reportDepartmentName,
+        rows: g.rows.map((r) => ({
+          sortAt: r.sortAt,
+          whenLabel: formatTimelineWhen(r.sortAt),
+          activity: r.activity,
+          pg: reportPgName === "All PGs" ? r.pg : undefined,
+          remarks: r.remarks,
+        })),
+      })),
+    });
+    drawPgActivityPageFooters(doc, generatedAt);
     doc.end();
     return;
   }
