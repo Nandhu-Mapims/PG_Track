@@ -389,26 +389,6 @@ function emptyWorkloadRow(pgId: string, pgName = ""): WorkloadRow {
   };
 }
 
-function WorkloadBar({ count, max, fillClass }: { count: number; max: number; fillClass: string }) {
-  const segments = 8;
-  const normalizedMax = Math.max(1, max);
-  const filled = count <= 0 ? 0 : Math.max(1, Math.round((count / normalizedMax) * segments));
-  return (
-    <div className="flex items-center gap-2">
-      <div className="flex items-center gap-0.5">
-        {Array.from({ length: segments }).map((_, index) => (
-          <span
-            key={index}
-            className={`h-3 w-2 rounded-sm ${index < filled ? fillClass : "bg-slate-200"}`}
-            aria-hidden
-          />
-        ))}
-      </div>
-      <span className="min-w-6 text-xs font-semibold tabular-nums text-slate-700">{count}</span>
-    </div>
-  );
-}
-
 function HelpPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   useEffect(() => {
     if (!open) return;
