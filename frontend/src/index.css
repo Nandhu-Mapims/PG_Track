@@ -15,7 +15,13 @@ body {
     radial-gradient(ellipse 80% 60% at 100% 0%, rgb(14 116 144 / 0.1), transparent 45%),
     linear-gradient(180deg, #f1f5f9 0%, #eef2f6 40%, #e8edf3 100%);
   min-height: 100vh;
+  min-height: 100dvh;
   color: #0f172a;
+  overflow-x: hidden;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
 }
 
 /* Focus ring for accessibility */

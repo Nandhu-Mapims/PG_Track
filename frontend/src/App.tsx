@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { FormEvent, ReactNode } from "react";
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Provider, useDispatch, useSelector } from "react-redux";
@@ -19,10 +20,12 @@ const uiBtnOutline = "rounded-xl border border-slate-200 bg-white px-4 py-2 text
 const uiBtnOutlineSm = "rounded-lg border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-700 transition hover:border-teal-200 hover:bg-teal-50/60 focus:outline-none focus:ring-2 focus:ring-teal-500/20 disabled:opacity-50";
 const uiInfoBar = "mt-3 rounded-xl border border-slate-200/80 bg-slate-50/90 px-3 py-2 text-xs text-slate-600";
 const uiFieldCompact =
-  "max-w-[220px] rounded-xl border border-slate-200 bg-slate-50/80 px-2.5 py-1.5 text-xs text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:bg-white focus:ring-2 focus:ring-teal-500/20";
+  "w-full md:max-w-[220px] rounded-xl border border-slate-200 bg-slate-50/80 px-2.5 py-1.5 text-xs text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:bg-white focus:ring-2 focus:ring-teal-500/20";
 const uiFieldSearchWide =
-  "w-80 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2 text-xs text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:bg-white focus:ring-2 focus:ring-teal-500/20";
+  "w-full md:w-80 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2 text-xs text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:bg-white focus:ring-2 focus:ring-teal-500/20";
 const uiBtnReport = "rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 shadow-sm transition hover:border-teal-300 hover:bg-teal-50/80 focus:outline-none focus:ring-2 focus:ring-teal-500/20";
+const uiTableScroll = "overflow-x-auto overscroll-x-contain [-webkit-overflow-scrolling:touch]";
+const uiTableSwipeHint = "border-t border-slate-100 px-4 py-2 text-[11px] text-slate-500 md:hidden";
 
 function pgDisplayName(pg: any): string {
   return String(pg?.fullName || pg?.username || "PG");
@@ -509,6 +512,38 @@ function BellIcon({ className }: { className?: string }) {
   );
 }
 
+function MenuIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.6}
+      stroke="currentColor"
+      className={className}
+      aria-hidden
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+    </svg>
+  );
+}
+
+function CloseIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.6}
+      stroke="currentColor"
+      className={className}
+      aria-hidden
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+    </svg>
+  );
+}
+
 function LogOutIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -632,6 +667,13 @@ function buildPgAlertItems(boardRows: unknown[], pgId: string, recentActivities:
   }
 
   return items;
+}
+
+/** Only urgent patient alerts count toward the PG bell badge — not reminders or info. */
+const PG_BADGE_ALERT_IDS = new Set(["delayed-review", "icu-critical", "pending-round"]);
+
+function pgAlertBadgeCount(items: AlertItem[]): number {
+  return items.filter((item) => PG_BADGE_ALERT_IDS.has(item.id)).length;
 }
 
 function buildAlertItems(
@@ -886,7 +928,7 @@ function HeaderQuickSearch() {
           .slice(0, 6);
 
   return (
-    <div ref={wrapRef} className={`relative ${user?.role === "PG" ? "w-full md:block" : "hidden md:block"}`}>
+    <div ref={wrapRef} className="relative w-full md:w-auto">
       <input
         placeholder={user?.role === "PG" ? "Search my patients by name or IP…" : "Search patients & PGs…"}
         className={`${user?.role === "PG" ? "w-full sm:w-80" : "w-80"} rounded-full border border-slate-200/90 bg-white/90 px-4 py-2.5 text-sm shadow-inner shadow-slate-900/5 outline-none ring-teal-500/0 transition placeholder:text-slate-400 focus:border-teal-500/50 focus:bg-white focus:ring-4 focus:ring-teal-500/15`}
@@ -1168,6 +1210,139 @@ function LoginPage() {
   );
 }
 
+const HOSPITAL_EMBLEM_SRC = "/image/adhiparasakthi-hospitals-emblem.rgb-backup.png";
+
+function HospitalBrandFooter({ centered = false }: { centered?: boolean }) {
+  return (
+    <div className={`flex items-center gap-3 ${centered ? "justify-center" : "px-2"}`}>
+      <div className="flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-gradient-to-br from-teal-100 via-emerald-50 to-teal-200 p-1 shadow-sm ring-1 ring-teal-400/35">
+        <img
+          src={HOSPITAL_EMBLEM_SRC}
+          alt=""
+          className="h-full w-full object-contain"
+          aria-hidden
+        />
+      </div>
+      <p
+        className={`text-[10px] font-bold uppercase leading-snug tracking-[0.12em] text-teal-200/95 md:text-[11px] ${centered ? "text-center" : ""}`}
+      >
+        Adhiparasakthi Hospital
+      </p>
+    </div>
+  );
+}
+
+function MobileOpsNavDrawer({
+  open,
+  onClose,
+  navBySection,
+  userLabel,
+  userRole,
+}: {
+  open: boolean;
+  onClose: () => void;
+  navBySection: [string, NavItem[]][];
+  userLabel: string;
+  userRole?: string;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open || typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      id="mobile-ops-nav"
+      className="fixed inset-0 z-[300] flex flex-col bg-gradient-to-b from-teal-950 via-teal-900 to-slate-950 md:hidden"
+      aria-modal="true"
+      role="dialog"
+      aria-label="Navigation menu"
+    >
+      <div className="flex shrink-0 items-center gap-3 border-b border-white/10 px-4 pb-4 pt-[max(0.875rem,env(safe-area-inset-top))]">
+        <button
+          type="button"
+          className="inline-flex shrink-0 touch-manipulation items-center justify-center rounded-xl border border-white/15 bg-white/10 p-2.5 text-white transition hover:bg-white/15"
+          onClick={onClose}
+          aria-label="Close navigation menu"
+        >
+          <CloseIcon className="h-5 w-5" />
+        </button>
+        <div className="min-w-0 flex-1">
+          <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-teal-300/85">Clinical Activity ERP</p>
+          <p className="truncate text-base font-semibold text-white">{userLabel}</p>
+          {userRole ? (
+            <p className="mt-0.5 text-xs font-medium uppercase tracking-wide text-teal-200/90">{userRole}</p>
+          ) : null}
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-4">
+        <SidebarNavSections navBySection={navBySection} isPgUser={false} onNavigate={onClose} />
+      </div>
+      <div className="shrink-0 border-t border-white/10 px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+        <HospitalBrandFooter centered />
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function SidebarNavSections({
+  navBySection,
+  isPgUser,
+  onNavigate,
+}: {
+  navBySection: [string, NavItem[]][];
+  isPgUser: boolean;
+  onNavigate?: () => void;
+}) {
+  return (
+    <>
+      {navBySection.map(([section, items]) => (
+        <div key={section} className="mb-5 last:mb-0">
+          <p
+            className={`px-2 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] ${
+              isPgUser ? "text-slate-400" : "text-teal-300/80"
+            }`}
+          >
+            {section}
+          </p>
+          <ul className={isPgUser ? "space-y-1" : "space-y-0.5"}>
+            {items.map((item) => (
+              <li key={item.to}>
+                <NavLink
+                  to={item.to}
+                  onClick={onNavigate}
+                  className={({ isActive }) =>
+                    isPgUser
+                      ? `block rounded-2xl px-3 py-2.5 text-sm font-medium transition ${
+                          isActive
+                            ? "bg-teal-50 text-teal-900 ring-1 ring-teal-200/80"
+                            : "text-slate-700 hover:bg-slate-50 hover:text-slate-900"
+                        }`
+                      : `block rounded-xl px-3 py-2.5 text-sm font-medium transition ${
+                          isActive
+                            ? "bg-white/12 text-white shadow-inner ring-1 ring-white/15"
+                            : "text-teal-100/85 hover:bg-white/5 hover:text-white"
+                        }`
+                  }
+                >
+                  {item.label}
+                </NavLink>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </>
+  );
+}
+
 function AppLayout({ children, title, subtitle }: { children: ReactNode; title: string; subtitle: string }) {
   const dispatch = useDispatch<AppDispatch>();
   const location = useLocation();
@@ -1175,6 +1350,7 @@ function AppLayout({ children, title, subtitle }: { children: ReactNode; title: 
   const user = useSelector((s: RootState) => s.auth.user);
   const [helpOpen, setHelpOpen] = useState(false);
   const [alertsOpen, setAlertsOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [alertsLoading, setAlertsLoading] = useState(false);
   const [alertItems, setAlertItems] = useState<AlertItem[]>([]);
   const [alertBadgeCount, setAlertBadgeCount] = useState(0);
@@ -1189,7 +1365,7 @@ function AppLayout({ children, title, subtitle }: { children: ReactNode; title: 
         const activitiesRes = await api.get(`/pg-activities/${user._id}`).catch(() => ({ data: [] }));
         const items = buildPgAlertItems(rows, String(user._id), activitiesRes.data);
         setAlertItems(items);
-        setAlertBadgeCount(items.length);
+        setAlertBadgeCount(pgAlertBadgeCount(items));
         return;
       }
 
@@ -1210,6 +1386,19 @@ function AppLayout({ children, title, subtitle }: { children: ReactNode; title: 
     const role = user?.role as UserRoleName | undefined;
     return navItems.filter((item) => !item.roles || (role && item.roles.includes(role)));
   }, [isPgUser, user?.role]);
+
+  useEffect(() => {
+    setMobileNavOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [mobileNavOpen]);
 
   useEffect(() => {
     if (!user) return;
@@ -1253,7 +1442,7 @@ function AppLayout({ children, title, subtitle }: { children: ReactNode; title: 
       />
       <button
         type="button"
-        className={`fixed bottom-6 right-6 z-40 h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-700 to-teal-600 text-white shadow-lg shadow-teal-900/35 ring-2 ring-white/90 transition hover:from-teal-800 hover:to-teal-700 hover:shadow-xl focus:outline-none focus-visible:ring-4 focus-visible:ring-teal-400/50 sm:bottom-8 sm:right-8 ${isPgUser ? "hidden md:flex" : "flex"}`}
+        className={`fixed bottom-6 right-6 z-40 h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-700 to-teal-600 text-white shadow-lg shadow-teal-900/35 ring-2 ring-white/90 transition hover:from-teal-800 hover:to-teal-700 hover:shadow-xl focus:outline-none focus-visible:ring-4 focus-visible:ring-teal-400/50 sm:bottom-8 sm:right-8 ${isPgUser ? "hidden md:flex" : mobileNavOpen ? "hidden" : "flex md:flex"}`}
         onClick={() => setAlertsOpen(true)}
         aria-label={isPgUser ? "Open my notifications" : "Open alerts panel"}
         aria-expanded={alertsOpen}
@@ -1267,69 +1456,106 @@ function AppLayout({ children, title, subtitle }: { children: ReactNode; title: 
         ) : null}
       </button>
       <header className="sticky top-0 z-30 shrink-0 border-b border-white/30 bg-white/75 shadow-sm shadow-slate-900/5 backdrop-blur-xl">
-        <div className="mx-auto flex max-w-[1440px] flex-wrap items-center gap-4 px-4 py-3.5 md:gap-6 md:px-8">
-          <div className="flex min-w-0 flex-1 items-center gap-3">
+        <div className="mx-auto max-w-[1440px] px-4 py-3 md:px-8 md:py-3.5">
+          <div className="flex items-center gap-2 md:gap-4">
+            {!isPgUser ? (
+              <button
+                type="button"
+                className="inline-flex shrink-0 touch-manipulation items-center justify-center rounded-xl border border-slate-200 bg-white/90 p-2.5 text-slate-700 shadow-sm transition hover:border-teal-200 hover:bg-teal-50/60 md:hidden"
+                onClick={() => setMobileNavOpen(true)}
+                aria-label="Open navigation menu"
+                aria-expanded={mobileNavOpen}
+                aria-controls="mobile-ops-nav"
+              >
+                <MenuIcon className="h-5 w-5" />
+              </button>
+            ) : null}
             <div
               className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-teal-600 to-cyan-700 text-xs font-bold tracking-tight text-white shadow-md shadow-teal-900/30 sm:flex"
               aria-hidden
             >
               PG
             </div>
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <h1 className="truncate text-base font-semibold tracking-tight text-slate-900 md:text-lg">Clinical Activity ERP</h1>
-              <p className="truncate text-[11px] text-slate-500 md:text-xs">
+              <p className="hidden truncate text-[11px] text-slate-500 sm:block md:text-xs">
                 {isPgUser ? "PG workspace · rounds · patient follow-up" : "Operations · residency · audit trail"}
               </p>
             </div>
-          </div>
-          <div className="flex w-full flex-wrap items-center justify-end gap-2 md:w-auto md:flex-nowrap">
-            <HeaderQuickSearch />
-            <button
-              type="button"
-              className="relative inline-flex items-center justify-center rounded-full border border-slate-200 bg-white/85 p-2.5 text-slate-700 shadow-sm transition hover:border-teal-200 hover:bg-teal-50/60 hover:text-teal-900"
-              onClick={() => setAlertsOpen(true)}
-              aria-label={isPgUser ? "Open my notifications" : "Open notifications"}
-            >
-              <BellIcon className="h-5 w-5" />
-              {alertBadgeCount > 0 ? (
-                <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-0.5 text-[9px] font-bold leading-none text-white ring-2 ring-white">
-                  {alertBadgeCount > 9 ? "9+" : alertBadgeCount}
-                </span>
-              ) : null}
-            </button>
-            <button
-              type="button"
-              className="rounded-full border border-slate-200 bg-white/80 px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:border-teal-200 hover:bg-teal-50/60 hover:text-teal-900"
-              onClick={() => setHelpOpen(true)}
-            >
-              Help
-            </button>
-            <div className="hidden items-center gap-2 rounded-full border border-slate-200/90 bg-slate-50/90 px-3 py-1.5 text-xs font-medium text-slate-700 shadow-inner sm:flex">
-              <span className="max-w-[140px] truncate">{user?.fullName || user?.username || "User"}</span>
-              <span className="rounded-md bg-teal-100/90 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-teal-900">
-                {user?.role || "—"}
-              </span>
+            <div className="hidden min-w-[280px] flex-1 md:block lg:max-w-sm">
+              <HeaderQuickSearch />
             </div>
-            <button
-              type="button"
-              className={
-                isPgUser
-                  ? "inline-flex items-center justify-center rounded-full border border-slate-200 bg-white/85 p-2.5 text-slate-700 shadow-sm transition hover:border-red-200 hover:bg-red-50/70 hover:text-red-700"
-                  : "rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:border-red-200 hover:bg-red-50 hover:text-red-800"
-              }
-              onClick={() => {
-                dispatch(clearAuth());
-                navigate("/login");
-              }}
-              aria-label="Log out"
-              title="Log out"
-            >
-              {isPgUser ? <LogOutIcon className="h-5 w-5" /> : "Log out"}
-            </button>
+            <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+              <button
+                type="button"
+                className="relative inline-flex items-center justify-center rounded-full border border-slate-200 bg-white/85 p-2.5 text-slate-700 shadow-sm transition hover:border-teal-200 hover:bg-teal-50/60 hover:text-teal-900"
+                onClick={() => setAlertsOpen(true)}
+                aria-label={isPgUser ? "Open my notifications" : "Open notifications"}
+              >
+                <BellIcon className="h-5 w-5" />
+                {alertBadgeCount > 0 ? (
+                  <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-0.5 text-[9px] font-bold leading-none text-white ring-2 ring-white">
+                    {alertBadgeCount > 9 ? "9+" : alertBadgeCount}
+                  </span>
+                ) : null}
+              </button>
+              <button
+                type="button"
+                className="hidden rounded-full border border-slate-200 bg-white/80 px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:border-teal-200 hover:bg-teal-50/60 hover:text-teal-900 md:inline-flex"
+                onClick={() => setHelpOpen(true)}
+              >
+                Help
+              </button>
+              <button
+                type="button"
+                className="inline-flex rounded-full border border-slate-200 bg-white/80 p-2.5 text-slate-700 shadow-sm transition hover:border-teal-200 hover:bg-teal-50/60 hover:text-teal-900 md:hidden"
+                onClick={() => setHelpOpen(true)}
+                aria-label="Open help"
+              >
+                <span className="text-xs font-bold">?</span>
+              </button>
+              <div className="hidden items-center gap-2 rounded-full border border-slate-200/90 bg-slate-50/90 px-3 py-1.5 text-xs font-medium text-slate-700 shadow-inner lg:flex">
+                <span className="max-w-[140px] truncate">{user?.fullName || user?.username || "User"}</span>
+                <span className="rounded-md bg-teal-100/90 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-teal-900">
+                  {user?.role || "—"}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-white/85 p-2.5 text-slate-700 shadow-sm transition hover:border-red-200 hover:bg-red-50/70 hover:text-red-700 md:px-4 md:py-2"
+                onClick={() => {
+                  dispatch(clearAuth());
+                  navigate("/login");
+                }}
+                aria-label="Log out"
+                title="Log out"
+              >
+                {isPgUser ? (
+                  <LogOutIcon className="h-5 w-5" />
+                ) : (
+                  <>
+                    <span className="hidden text-sm font-medium text-slate-700 md:inline">Log out</span>
+                    <LogOutIcon className="h-5 w-5 md:hidden" />
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+          <div className="mt-3 md:hidden">
+            <HeaderQuickSearch />
           </div>
         </div>
       </header>
-      <div className={`mx-auto flex w-full max-w-[1440px] flex-1 flex-col gap-6 p-4 ${isPgUser ? "pb-28" : "pb-12"} md:flex-row md:items-stretch md:gap-8 md:p-8`}>
+      {!isPgUser ? (
+        <MobileOpsNavDrawer
+          open={mobileNavOpen}
+          onClose={() => setMobileNavOpen(false)}
+          navBySection={navBySection}
+          userLabel={user?.fullName || user?.username || "User"}
+          userRole={user?.role}
+        />
+      ) : null}
+      <div className={`mx-auto flex w-full max-w-[1440px] flex-1 flex-col gap-6 p-4 ${isPgUser ? "pb-[calc(7rem+env(safe-area-inset-bottom))]" : "pb-8"} md:flex-row md:items-stretch md:gap-8 md:p-8 ${isPgUser ? "md:pb-8" : ""}`}>
         {isPgUser ? (
           <nav className="hidden w-full shrink-0 md:sticky md:top-24 md:flex md:h-[calc(100dvh-6rem)] md:w-[260px] md:max-w-[260px] md:self-start md:flex-col md:overflow-hidden md:rounded-3xl md:border md:border-slate-200/80 md:bg-white/95 md:p-4 md:shadow-[0_12px_32px_-12px_rgba(15,23,42,0.14)]">
             <div className="rounded-2xl bg-gradient-to-r from-teal-600 to-cyan-600 px-4 py-4 text-white">
@@ -1338,62 +1564,16 @@ function AppLayout({ children, title, subtitle }: { children: ReactNode; title: 
               <p className="mt-1 text-xs text-white/80">Focused patient list, quick actions, and daily workflow.</p>
             </div>
             <div className="mt-4 min-h-0 flex-1 overflow-y-auto">
-              {navBySection.map(([section, items]) => (
-                <div key={section} className="mb-5 last:mb-0">
-                  <p className="px-2 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-400">{section}</p>
-                  <ul className="space-y-1">
-                    {items.map((item) => (
-                      <li key={item.to}>
-                        <NavLink
-                          to={item.to}
-                          className={({ isActive }) =>
-                            `block rounded-2xl px-3 py-2.5 text-sm font-medium transition ${
-                              isActive
-                                ? "bg-teal-50 text-teal-900 ring-1 ring-teal-200/80"
-                                : "text-slate-700 hover:bg-slate-50 hover:text-slate-900"
-                            }`
-                          }
-                        >
-                          {item.label}
-                        </NavLink>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ))}
+              <SidebarNavSections navBySection={navBySection} isPgUser />
             </div>
           </nav>
         ) : (
-          <nav className="flex w-full shrink-0 flex-col rounded-2xl border border-teal-950/20 bg-gradient-to-b from-teal-950 via-teal-900 to-slate-950 p-4 shadow-xl shadow-teal-950/25 md:sticky md:top-24 md:h-[calc(100dvh-6rem)] md:w-[280px] md:max-w-[280px] md:self-start md:overflow-hidden">
+          <nav className="hidden w-full shrink-0 flex-col rounded-2xl border border-teal-950/20 bg-gradient-to-b from-teal-950 via-teal-900 to-slate-950 p-4 shadow-xl shadow-teal-950/25 md:sticky md:top-24 md:flex md:h-[calc(100dvh-6rem)] md:w-[280px] md:max-w-[280px] md:self-start md:overflow-hidden">
             <div className="min-h-0 flex-1 space-y-0 overflow-y-auto md:overflow-y-auto">
-              {navBySection.map(([section, items]) => (
-                <div key={section} className="mb-5 last:mb-0">
-                  <p className="px-2 pb-2 text-[10px] font-bold uppercase tracking-[0.14em] text-teal-300/80">{section}</p>
-                  <ul className="space-y-0.5">
-                    {items.map((item) => (
-                      <li key={item.to}>
-                        <NavLink
-                          to={item.to}
-                          className={({ isActive }) =>
-                            `block rounded-xl px-3 py-2.5 text-sm font-medium transition ${
-                              isActive
-                                ? "bg-white/12 text-white shadow-inner ring-1 ring-white/15"
-                                : "text-teal-100/85 hover:bg-white/5 hover:text-white"
-                            }`
-                          }
-                        >
-                          {item.label}
-                        </NavLink>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ))}
+              <SidebarNavSections navBySection={navBySection} isPgUser={false} />
             </div>
             <div className="mt-4 shrink-0 border-t border-white/10 pt-4">
-              <p className="px-2 text-[11px] font-bold uppercase leading-snug tracking-[0.12em] text-teal-200">
-                Melmaruvathur Adhiparasakthi Hospital
-              </p>
+              <HospitalBrandFooter />
             </div>
           </nav>
         )}
@@ -1451,20 +1631,21 @@ function AppLayout({ children, title, subtitle }: { children: ReactNode; title: 
         </main>
       </div>
       {isPgUser ? (
-        <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200/80 bg-white/95 px-2 py-2 shadow-[0_-12px_32px_-20px_rgba(15,23,42,0.3)] backdrop-blur md:hidden">
-          <div className="mx-auto grid max-w-xl grid-cols-5 gap-1">
+        <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200/80 bg-white/95 px-1 py-1.5 shadow-[0_-12px_32px_-20px_rgba(15,23,42,0.3)] backdrop-blur md:hidden pb-[max(0.375rem,env(safe-area-inset-bottom))]">
+          <div className="mx-auto grid max-w-xl grid-cols-6 gap-0.5">
             {[
               { to: "/dashboard/pg", label: "Home" },
               { to: "/my-patients", label: "Patients" },
               { to: "/activity", label: "Add" },
               { to: "/timeline", label: "Timeline" },
               { to: "/completed-cases", label: "Cases" },
+              { to: "/profile", label: "Profile" },
             ].map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}
                 className={({ isActive }) =>
-                  `flex flex-col items-center justify-center rounded-2xl px-2 py-2 text-[11px] font-semibold transition ${
+                  `flex flex-col items-center justify-center rounded-xl px-1 py-2 text-[10px] font-semibold leading-tight transition sm:text-[11px] ${
                     isActive ? "bg-teal-50 text-teal-800" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"
                   }`
                 }
@@ -1860,7 +2041,8 @@ function MastersPage() {
       </div>
       <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
         <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">Department Registry</div>
-        <table className="w-full text-sm">
+        <div className={uiTableScroll}>
+        <table className="w-full min-w-[480px] text-sm">
           <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
             <tr>
               <th className="px-4 py-2">Department</th>
@@ -1891,10 +2073,13 @@ function MastersPage() {
             ))}
           </tbody>
         </table>
+        </div>
+        <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
       </div>
       <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
         <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">Unit Mapping</div>
-        <table className="w-full text-sm">
+        <div className={uiTableScroll}>
+        <table className="w-full min-w-[640px] text-sm">
           <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
             <tr>
               <th className="px-4 py-2">Unit</th>
@@ -1927,10 +2112,13 @@ function MastersPage() {
             ))}
           </tbody>
         </table>
+        </div>
+        <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
       </div>
       <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
         <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">Activity types</div>
-        <table className="w-full text-sm">
+        <div className={uiTableScroll}>
+        <table className="w-full min-w-[360px] text-sm">
           <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
             <tr>
               <th className="px-4 py-2">Name</th>
@@ -1959,6 +2147,8 @@ function MastersPage() {
             ))}
           </tbody>
         </table>
+        </div>
+        <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
       </div>
     </AppLayout>
   );
@@ -2288,6 +2478,7 @@ function AdmissionPage() {
                   ))}
                 </tbody>
               </table>
+              <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] text-slate-500 md:hidden">Swipe horizontally to see all columns.</p>
             </div>
           ) : null}
           {hisCounts && hisTotalPages > 1 ? (
@@ -2962,7 +3153,8 @@ function AssignmentPage() {
         <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">
           Live board snapshot {loading ? "(loading…)" : null}
         </div>
-        <table className="w-full text-sm">
+        <div className={uiTableScroll}>
+        <table className="w-full min-w-[720px] text-sm">
           <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
             <tr>
               <th className="px-4 py-2">Patient</th>
@@ -3012,6 +3204,8 @@ function AssignmentPage() {
             ))}
           </tbody>
         </table>
+        </div>
+        <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
         {!loading && board.length === 0 ? <p className="p-4 text-sm text-slate-500">No admitted patients on the board.</p> : null}
       </div>
     </AppLayout>
@@ -4856,7 +5050,8 @@ function AuditLogsPage() {
         </div>
       </div>
       <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
-        <table className="w-full text-sm">
+        <div className={uiTableScroll}>
+        <table className="w-full min-w-[720px] text-sm">
           <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
             <tr>
               <th className="px-4 py-2">Time</th>
@@ -4895,6 +5090,8 @@ function AuditLogsPage() {
             ))}
           </tbody>
         </table>
+        </div>
+        <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
         {!loading && rows.length === 0 ? <p className="p-4 text-sm text-slate-500">No audit entries yet.</p> : null}
         {!loading && rows.length > 0 && filteredRows.length === 0 ? (
           <p className="p-4 text-sm text-slate-500">No matching audit entries for this search.</p>

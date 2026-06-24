@@ -1,15 +1,118 @@
-version: "3.9"
+# PG Clinical Activity ERP — Hostinger VPS deployment
+#
+# Isolated from other stacks on the same server (no shared ports/volumes/networks).
+#
+# Host ports (chosen to avoid conflicts with existing projects):
+#   ambulance_qr      → 8085, 5010
+#   gen_cl            → 8088, 5011
+#   gen_cl_dental     → 8089, 5012
+#   tms               → 8090, 5013
+#   pfs               → 8091, 5014
+#   mrd_cl            → 3000, 5000, 27017
+#   pg_cl (this app)  → 8092 (nginx edge), 5015 (backend API direct, optional)
+#
+# MongoDB is internal only (no host port) — avoids conflict with mrd-mongodb on 27017.
+#
+# Deploy on server:
+#   cp backend/env.hostinger.example backend/.env.hostinger
+#   # edit backend/.env.hostinger (JWT_SECRET, HIS credentials, etc.)
+#   docker compose up -d --build
+#
+# App URL: https://pg.mapims.edu.in  (after DNS + host nginx + certbot)
+# Docker direct: http://<server-ip>:8092
+# API direct: http://<server-ip>:5015/api
+
+name: pg_cl
 
 services:
   mongo:
     image: mongo:7
-    container_name: pgtracker-mongo
+    container_name: pg_cl_mongo
+    restart: unless-stopped
+    volumes:
+      - pg_cl_mongo_data:/data/db
+    networks:
+      - pg_cl_internal
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pg_cl_backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env.hostinger
+    environment:
+      PORT: "4000"
+      MONGO_URI: mongodb://mongo:27017/pg_tracking
+    ports:
+      - "5015:4000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - pg_cl_internal
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: pg_cl_frontend
+    restart: unless-stopped
+    expose:
+      - "80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - pg_cl_internal
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: pg_cl_nginx
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "8092:80"
     volumes:
-      - mongo_data:/data/db
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - pg_cl_internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+networks:
+  pg_cl_internal:
+    name: pg_cl_internal
+    driver: bridge
 
 volumes:
-  mongo_data:
-
+  pg_cl_mongo_data:
+    name: pg_cl_mongo_data
