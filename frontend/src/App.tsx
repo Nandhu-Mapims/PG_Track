@@ -805,6 +805,7 @@ function AlertsPanel({
 const navItems: NavItem[] = [
   { to: "/dashboard/pg", label: "Executive Dashboard", section: "Operations" },
   { to: "/masters", label: "Master Data Registry", section: "Administration", roles: ["Admin", "HOD"] },
+  { to: "/users", label: "User Accounts", section: "Administration", roles: ["Admin"] },
   { to: "/audit-logs", label: "Audit Log Center", section: "Administration", roles: ["Admin", "MRD"] },
   {
     to: "/completed-cases-by-pg",
@@ -5247,6 +5248,309 @@ function ReportsPage() {
   );
 }
 
+function UsersPage() {
+  const user = useSelector((s: RootState) => s.auth.user);
+  const [users, setUsers] = useState<any[]>([]);
+  const [departments, setDepartments] = useState<any[]>([]);
+  const [units, setUnits] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitMessage, setSubmitMessage] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [roleFilter, setRoleFilter] = useState("");
+  const [search, setSearch] = useState("");
+  const [form, setForm] = useState({
+    username: "",
+    password: "",
+    confirmPassword: "",
+    fullName: "",
+    role: "PG" as UserRoleName,
+    departmentId: "",
+    unitId: "",
+    mobileNumber: "",
+    email: "",
+    status: "Active" as "Active" | "Inactive",
+    yearOfResidency: "1",
+    joiningDate: "",
+  });
+
+  const loadUsers = useCallback(async () => {
+    setLoading(true);
+    setLoadError("");
+    try {
+      const [usersRes, deptRes, unitRes] = await Promise.all([
+        api.get("/users", { params: { includeInactive: true } }),
+        api.get("/departments"),
+        api.get("/units"),
+      ]);
+      setUsers(Array.isArray(usersRes.data) ? usersRes.data : []);
+      setDepartments(deptRes.data || []);
+      setUnits(unitRes.data || []);
+    } catch {
+      setLoadError("Could not load user accounts.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadUsers();
+  }, [loadUsers]);
+
+  const filteredUnits = useMemo(
+    () => units.filter((u) => !form.departmentId || String(u.departmentId?._id || u.departmentId) === form.departmentId),
+    [units, form.departmentId],
+  );
+
+  const filteredUsers = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    return users.filter((row) => {
+      if (roleFilter && row.role !== roleFilter) return false;
+      if (!needle) return true;
+      return [row.username, row.fullName, row.role, row.email, row.mobileNumber, row.departmentId?.name]
+        .filter(Boolean)
+        .map((v) => String(v).toLowerCase())
+        .some((v) => v.includes(needle));
+    });
+  }, [users, roleFilter, search]);
+
+  const resetForm = () => {
+    setForm({
+      username: "",
+      password: "",
+      confirmPassword: "",
+      fullName: "",
+      role: "PG",
+      departmentId: "",
+      unitId: "",
+      mobileNumber: "",
+      email: "",
+      status: "Active",
+      yearOfResidency: "1",
+      joiningDate: "",
+    });
+    setEditingUserId(null);
+    setShowForm(false);
+  };
+
+  const openCreateForm = () => {
+    setSubmitMessage("");
+    resetForm();
+    setShowForm(true);
+  };
+
+  const openEditForm = (row: any) => {
+    setSubmitMessage("");
+    setEditingUserId(String(row._id));
+    setShowForm(true);
+    setForm({
+      username: row.username || "",
+      password: "",
+      confirmPassword: "",
+      fullName: row.fullName || "",
+      role: (row.role as UserRoleName) || "PG",
+      departmentId: String(row.departmentId?._id || row.departmentId || ""),
+      unitId: String(row.unitId?._id || row.unitId || ""),
+      mobileNumber: row.mobileNumber || "",
+      email: row.email || "",
+      status: row.status === "Inactive" ? "Inactive" : "Active",
+      yearOfResidency: String(row.yearOfResidency || 1),
+      joiningDate: row.joiningDate ? String(row.joiningDate).slice(0, 10) : "",
+    });
+  };
+
+  const submitUser = async () => {
+    const username = form.username.trim();
+    const fullName = form.fullName.trim();
+    if (!username || !fullName) {
+      setSubmitMessage("Username and full name are required.");
+      return;
+    }
+    if (!editingUserId && !form.password.trim()) {
+      setSubmitMessage("Password is required for new users.");
+      return;
+    }
+    if (form.password && form.password.length < 6) {
+      setSubmitMessage("Password must be at least 6 characters.");
+      return;
+    }
+    if (form.password && form.password !== form.confirmPassword) {
+      setSubmitMessage("Password and confirmation do not match.");
+      return;
+    }
+
+    setSubmitting(true);
+    setSubmitMessage("");
+    try {
+      const payload: Record<string, unknown> = {
+        username,
+        fullName,
+        role: form.role,
+        departmentId: form.departmentId || undefined,
+        unitId: form.unitId || undefined,
+        mobileNumber: form.mobileNumber.trim() || undefined,
+        email: form.email.trim() || undefined,
+        status: form.status,
+      };
+      if (form.role === "PG") {
+        payload.yearOfResidency = Number(form.yearOfResidency) || 1;
+        if (form.joiningDate) payload.joiningDate = form.joiningDate;
+      }
+      if (form.password.trim()) payload.password = form.password;
+
+      if (editingUserId) {
+        await api.put(`/users/${editingUserId}`, payload);
+        setSubmitMessage(`User "${fullName}" updated.`);
+      } else {
+        await api.post("/users", payload);
+        setSubmitMessage(`User "${fullName}" created.`);
+      }
+      resetForm();
+      await loadUsers();
+    } catch (error: any) {
+      setSubmitMessage(error?.response?.data?.message || `Could not ${editingUserId ? "update" : "create"} user.`);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const toggleUserStatus = async (row: any) => {
+    const nextStatus = row.status === "Inactive" ? "Active" : "Inactive";
+    setSubmitting(true);
+    setSubmitMessage("");
+    try {
+      await api.patch(`/users/${row._id}/status`, { status: nextStatus });
+      setSubmitMessage(`${row.fullName || row.username} marked ${nextStatus}.`);
+      await loadUsers();
+    } catch (error: any) {
+      setSubmitMessage(error?.response?.data?.message || "Could not update user status.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <AppLayout title="User Accounts" subtitle="Create and manage logins for Admin, HOD, Consultant, PG, and MRD roles.">
+      <div className="rounded-2xl border border-slate-200/70 bg-white/95 p-5 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900">Account registry</h3>
+            <p className="mt-1 text-xs text-slate-500">Logged in as {user?.role || "User"}. Passwords are stored hashed.</p>
+          </div>
+          <button type="button" className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800" onClick={openCreateForm}>
+            Create user
+          </button>
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-[1fr_auto]">
+          <input className={uiField} placeholder="Search by name, username, role, email…" value={search} onChange={(e) => setSearch(e.target.value)} />
+          <select className={uiFieldCompact} value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}>
+            <option value="">All roles</option>
+            {(["Admin", "HOD", "Consultant", "PG", "MRD"] as UserRoleName[]).map((role) => (
+              <option key={role} value={role}>{role}</option>
+            ))}
+          </select>
+        </div>
+        {loadError ? <p className="mt-3 text-sm text-red-700">{loadError}</p> : null}
+        {submitMessage ? <p className="mt-3 text-sm text-slate-600">{submitMessage}</p> : null}
+      </div>
+
+      {showForm ? (
+        <div className="rounded-2xl border border-teal-200/70 bg-gradient-to-r from-white to-teal-50/40 p-5 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)]">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold text-slate-900">{editingUserId ? "Edit user" : "Create user"}</h3>
+            <button type="button" className={uiBtnOutlineSm} onClick={resetForm}>Cancel</button>
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+            <input className={uiField} placeholder="Username" value={form.username} onChange={(e) => setForm((p) => ({ ...p, username: e.target.value }))} />
+            <input className={uiField} placeholder="Full name" value={form.fullName} onChange={(e) => setForm((p) => ({ ...p, fullName: e.target.value }))} />
+            <select className={uiField} value={form.role} onChange={(e) => setForm((p) => ({ ...p, role: e.target.value as UserRoleName }))}>
+              {(["Admin", "HOD", "Consultant", "PG", "MRD"] as UserRoleName[]).map((role) => (
+                <option key={role} value={role}>{role}</option>
+              ))}
+            </select>
+            <input type="password" className={uiField} placeholder={editingUserId ? "New password (optional)" : "Password"} value={form.password} onChange={(e) => setForm((p) => ({ ...p, password: e.target.value }))} autoComplete="new-password" />
+            <input type="password" className={uiField} placeholder={editingUserId ? "Confirm new password" : "Confirm password"} value={form.confirmPassword} onChange={(e) => setForm((p) => ({ ...p, confirmPassword: e.target.value }))} autoComplete="new-password" />
+            <select className={uiField} value={form.status} onChange={(e) => setForm((p) => ({ ...p, status: e.target.value as "Active" | "Inactive" }))}>
+              <option value="Active">Active</option>
+              <option value="Inactive">Inactive</option>
+            </select>
+            <select className={uiField} value={form.departmentId} onChange={(e) => setForm((p) => ({ ...p, departmentId: e.target.value, unitId: "" }))}>
+              <option value="">Department (optional)</option>
+              {departments.map((d) => (
+                <option key={d._id} value={d._id}>{d.name}</option>
+              ))}
+            </select>
+            <select className={uiField} value={form.unitId} onChange={(e) => setForm((p) => ({ ...p, unitId: e.target.value }))}>
+              <option value="">Unit (optional)</option>
+              {filteredUnits.map((u) => (
+                <option key={u._id} value={u._id}>{u.name}</option>
+              ))}
+            </select>
+            <input className={uiField} placeholder="Mobile number" value={form.mobileNumber} onChange={(e) => setForm((p) => ({ ...p, mobileNumber: e.target.value }))} />
+            <input className={uiField} placeholder="Email" type="email" value={form.email} onChange={(e) => setForm((p) => ({ ...p, email: e.target.value }))} />
+            {form.role === "PG" ? (
+              <>
+                <input type="number" min={1} max={6} className={uiField} placeholder="Year of residency" value={form.yearOfResidency} onChange={(e) => setForm((p) => ({ ...p, yearOfResidency: e.target.value }))} />
+                <input type="date" className={uiField} value={form.joiningDate} onChange={(e) => setForm((p) => ({ ...p, joiningDate: e.target.value }))} />
+              </>
+            ) : null}
+          </div>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button type="button" className="rounded-lg bg-teal-700 px-4 py-2 text-sm text-white hover:bg-teal-800 disabled:opacity-50" onClick={() => void submitUser()} disabled={submitting}>
+              {submitting ? "Saving…" : editingUserId ? "Save changes" : "Create user"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
+        <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">Users {loading ? "(loading…)" : `(${filteredUsers.length})`}</div>
+        <div className={uiTableScroll}>
+          <table className="w-full min-w-[760px] text-sm">
+            <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
+              <tr>
+                <th className="px-4 py-2">Username</th>
+                <th className="px-4 py-2">Full name</th>
+                <th className="px-4 py-2">Role</th>
+                <th className="px-4 py-2">Department</th>
+                <th className="px-4 py-2">Status</th>
+                <th className="px-4 py-2">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredUsers.map((row) => (
+                <tr key={String(row._id)} className="border-t border-slate-100">
+                  <td className="px-4 py-2 font-mono text-xs">{row.username}</td>
+                  <td className="px-4 py-2">{row.fullName}</td>
+                  <td className="px-4 py-2"><span className="rounded-full bg-teal-50 px-2 py-1 text-xs font-medium text-teal-800">{row.role}</span></td>
+                  <td className="px-4 py-2 text-slate-600">{row.departmentId?.name || "—"}</td>
+                  <td className="px-4 py-2">
+                    <span className={`rounded-full px-2 py-1 text-xs font-medium ${row.status === "Inactive" ? "bg-slate-100 text-slate-600" : "bg-emerald-50 text-emerald-700"}`}>
+                      {row.status || "Active"}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2">
+                    <div className="flex flex-wrap gap-2">
+                      <button type="button" className={uiBtnOutlineSm} onClick={() => openEditForm(row)}>Edit</button>
+                      <button type="button" className={uiBtnOutlineSm} onClick={() => void toggleUserStatus(row)} disabled={submitting}>
+                        {row.status === "Inactive" ? "Activate" : "Deactivate"}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
+        {!loading && filteredUsers.length === 0 ? <p className="p-4 text-sm text-slate-500">No users match this filter.</p> : null}
+      </div>
+    </AppLayout>
+  );
+}
+
 function MobileHooksPage() {
   return (
     <AppLayout title="Mobile Readiness Hooks" subtitle="Prepared UI extension points for Phase 3 mobile workflows.">
@@ -5293,6 +5597,14 @@ function ProtectedRoutes() {
         element={
           <RequireRole roles={["Admin", "HOD"]}>
             <MastersPage />
+          </RequireRole>
+        }
+      />
+      <Route
+        path="/users"
+        element={
+          <RequireRole roles={["Admin"]}>
+            <UsersPage />
           </RequireRole>
         }
       />

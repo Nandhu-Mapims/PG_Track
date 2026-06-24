@@ -163,9 +163,211 @@ apiRouter.post("/auth/login", async (req: Request, res: Response) => {
 
 apiRouter.post("/auth/logout", authMiddleware, (_req: Request, res: Response) => res.json({ message: "Logged out" }));
 apiRouter.get("/auth/profile", authMiddleware, async (req: AuthRequest, res: Response) => {
-  const user = await User.findById(req.user?.id);
+  const user = await User.findById(req.user?.id).select("-password");
   res.json(user);
 });
+
+const USER_ROLES = ["Admin", "HOD", "Consultant", "PG", "MRD"] as const;
+
+function userListFilter(req: Request): Record<string, unknown> {
+  return String(req.query.includeInactive || "") === "true" ? {} : { status: "Active" as const };
+}
+
+async function attachPgMasterFields(users: any[]) {
+  const pgIds = users.filter((u) => u.role === "PG").map((u) => u._id);
+  if (pgIds.length === 0) return users;
+  const pgMasters = await PGMaster.find({ userId: { $in: pgIds } })
+    .select("userId yearOfResidency joiningDate")
+    .lean();
+  const byUserId = new Map(
+    pgMasters.map((row: any) => [
+      String(row.userId),
+      { yearOfResidency: row.yearOfResidency, joiningDate: row.joiningDate },
+    ]),
+  );
+  return users.map((user) => ({
+    ...user,
+    ...(user.role === "PG" ? byUserId.get(String(user._id)) || {} : {}),
+  }));
+}
+
+apiRouter.get("/users", authMiddleware, requireRoles("Admin"), async (req, res) => {
+  const users = await User.find(userListFilter(req))
+    .populate("departmentId unitId")
+    .sort({ role: 1, fullName: 1 })
+    .select("-password")
+    .lean();
+  res.json(await attachPgMasterFields(users));
+});
+
+apiRouter.get("/users/:id", authMiddleware, requireRoles("Admin"), async (req, res) => {
+  const user = await User.findById(req.params.id).populate("departmentId unitId").select("-password").lean();
+  if (!user) return res.status(404).json({ message: "User not found" });
+  const [withPg] = await attachPgMasterFields([user]);
+  res.json(withPg);
+});
+
+apiRouter.post("/users", authMiddleware, requireRoles("Admin"), auditLogger("User", "Create User"), async (req, res) => {
+  const {
+    username,
+    password,
+    fullName,
+    role,
+    departmentId,
+    unitId,
+    mobileNumber,
+    email,
+    status,
+    yearOfResidency,
+    joiningDate,
+  } = req.body as Record<string, unknown>;
+
+  const cleanUsername = String(username || "").trim();
+  const cleanFullName = String(fullName || "").trim();
+  const cleanRole = String(role || "").trim();
+  const cleanPassword = String(password || "");
+
+  if (!cleanUsername || !cleanFullName || !cleanRole || !cleanPassword) {
+    return res.status(400).json({ message: "Username, password, full name, and role are required." });
+  }
+  if (!USER_ROLES.includes(cleanRole as (typeof USER_ROLES)[number])) {
+    return res.status(400).json({ message: "Invalid role." });
+  }
+  if (cleanPassword.length < 6) {
+    return res.status(400).json({ message: "Password must be at least 6 characters." });
+  }
+  if (await User.findOne({ username: cleanUsername })) {
+    return res.status(409).json({ message: "Username already exists." });
+  }
+
+  const user = await User.create({
+    username: cleanUsername,
+    password: cleanPassword,
+    fullName: cleanFullName,
+    role: cleanRole as (typeof USER_ROLES)[number],
+    departmentId: departmentId ? toObjectId(String(departmentId)) : undefined,
+    unitId: unitId ? toObjectId(String(unitId)) : undefined,
+    mobileNumber: mobileNumber ? String(mobileNumber) : undefined,
+    email: email ? String(email) : undefined,
+    status: status === "Inactive" ? ("Inactive" as const) : ("Active" as const),
+  });
+
+  if (cleanRole === "PG") {
+    await PGMaster.create({
+      userId: user._id,
+      yearOfResidency: Number(yearOfResidency) > 0 ? Number(yearOfResidency) : 1,
+      joiningDate: joiningDate ? new Date(String(joiningDate)) : new Date(),
+    });
+  }
+
+  const created = await User.findById(user._id).populate("departmentId unitId").select("-password").lean();
+  if (!created) return res.status(500).json({ message: "User created but could not be loaded." });
+  const [safe] = await attachPgMasterFields([created]);
+  return res.status(201).json(safe);
+});
+
+apiRouter.put("/users/:id", authMiddleware, requireRoles("Admin"), auditLogger("User", "Update User"), async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) return res.status(404).json({ message: "User not found" });
+
+  const {
+    username,
+    password,
+    fullName,
+    role,
+    departmentId,
+    unitId,
+    mobileNumber,
+    email,
+    status,
+    yearOfResidency,
+    joiningDate,
+  } = req.body as Record<string, unknown>;
+
+  if (username !== undefined) {
+    const cleanUsername = String(username).trim();
+    if (!cleanUsername) return res.status(400).json({ message: "Username cannot be empty." });
+    const duplicate = await User.findOne({ username: cleanUsername, _id: { $ne: user._id } });
+    if (duplicate) return res.status(409).json({ message: "Username already exists." });
+    user.set("username", cleanUsername);
+  }
+  if (fullName !== undefined) user.set("fullName", String(fullName).trim());
+  if (role !== undefined) {
+    const cleanRole = String(role).trim();
+    if (!USER_ROLES.includes(cleanRole as (typeof USER_ROLES)[number])) {
+      return res.status(400).json({ message: "Invalid role." });
+    }
+    user.set("role", cleanRole as (typeof USER_ROLES)[number]);
+  }
+  if (departmentId !== undefined) user.set("departmentId", departmentId ? toObjectId(String(departmentId)) : undefined);
+  if (unitId !== undefined) user.set("unitId", unitId ? toObjectId(String(unitId)) : undefined);
+  if (mobileNumber !== undefined) user.set("mobileNumber", mobileNumber ? String(mobileNumber) : undefined);
+  if (email !== undefined) user.set("email", email ? String(email) : undefined);
+  if (status !== undefined) user.set("status", status === "Inactive" ? "Inactive" : "Active");
+
+  if (password !== undefined && String(password).trim()) {
+    const cleanPassword = String(password);
+    if (cleanPassword.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters." });
+    }
+    user.set("password", cleanPassword);
+  }
+
+  await user.save();
+
+  if (user.get("role") === "PG") {
+    const pgPayload: Record<string, unknown> = {};
+    if (yearOfResidency !== undefined) {
+      pgPayload.yearOfResidency = Number(yearOfResidency) > 0 ? Number(yearOfResidency) : 1;
+    }
+    if (joiningDate !== undefined) {
+      pgPayload.joiningDate = joiningDate ? new Date(String(joiningDate)) : new Date();
+    }
+    if (Object.keys(pgPayload).length > 0) {
+      await PGMaster.findOneAndUpdate({ userId: user._id }, pgPayload, { upsert: true, new: true });
+    }
+  }
+
+  const updated = await User.findById(user._id).populate("departmentId unitId").select("-password").lean();
+  if (!updated) return res.status(500).json({ message: "User updated but could not be loaded." });
+  const [safe] = await attachPgMasterFields([updated]);
+  return res.json(safe);
+});
+
+apiRouter.patch(
+  "/users/:id/status",
+  authMiddleware,
+  requireRoles("Admin"),
+  auditLogger("User", "Set User Status"),
+  async (req, res) => {
+    const status = req.body?.status === "Inactive" ? "Inactive" : "Active";
+    const user = await User.findByIdAndUpdate(req.params.id, { status }, { new: true })
+      .populate("departmentId unitId")
+      .select("-password")
+      .lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const [safe] = await attachPgMasterFields([user]);
+    return res.json(safe);
+  },
+);
+
+apiRouter.patch(
+  "/users/:id/password",
+  authMiddleware,
+  requireRoles("Admin"),
+  auditLogger("User", "Reset User Password"),
+  async (req, res) => {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const password = String(req.body?.password || "");
+    if (password.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters." });
+    }
+    user.set("password", password);
+    await user.save();
+    return res.json({ message: "Password updated." });
+  },
+);
 
 apiRouter.get("/pg", authMiddleware, async (_req, res) => {
   const users = await User.find({ role: "PG", status: "Active" })
@@ -199,8 +401,25 @@ apiRouter.post("/pg", authMiddleware, requireRoles("Admin"), auditLogger("PGMast
   res.status(201).json(user);
 });
 apiRouter.put("/pg/:id", authMiddleware, requireRoles("Admin"), auditLogger("PGMaster", "Update PG"), async (req, res) => {
-  const user = await User.findByIdAndUpdate(req.params.id, req.body, { new: true });
-  res.json(user);
+  const user = await User.findById(req.params.id);
+  if (!user) return res.status(404).json({ message: "User not found" });
+  const { password, yearOfResidency, joiningDate, ...rest } = req.body as Record<string, unknown>;
+  user.set(rest);
+  if (password && String(password).trim()) {
+    if (String(password).length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters." });
+    }
+    user.set("password", String(password));
+  }
+  await user.save();
+  if (yearOfResidency !== undefined || joiningDate !== undefined) {
+    const pgPayload: Record<string, unknown> = {};
+    if (yearOfResidency !== undefined) pgPayload.yearOfResidency = Number(yearOfResidency) || 1;
+    if (joiningDate !== undefined) pgPayload.joiningDate = joiningDate ? new Date(String(joiningDate)) : new Date();
+    await PGMaster.findOneAndUpdate({ userId: user._id }, pgPayload, { upsert: true, new: true });
+  }
+  const updated = await User.findById(user._id).populate("departmentId unitId").select("-password");
+  res.json(updated);
 });
 apiRouter.delete("/pg/:id", authMiddleware, requireRoles("Admin"), auditLogger("PGMaster", "Deactivate PG"), async (req, res) => {
   const user = await User.findByIdAndUpdate(req.params.id, { status: "Inactive" }, { new: true });
