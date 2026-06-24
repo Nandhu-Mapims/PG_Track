@@ -13,10 +13,10 @@
 #
 # MongoDB is internal only (no host port) — avoids conflict with mrd-mongodb on 27017.
 #
-# Deploy on server:
-#   cp backend/env.hostinger.example backend/.env.hostinger
-#   # edit backend/.env.hostinger (JWT_SECRET, HIS credentials, etc.)
+# Deploy on server (uses your existing backend/.env):
 #   docker compose up -d --build
+#
+# Note: MONGO_URI in compose overrides .env to use the internal mongo container.
 #
 # App URL: https://pg.mapims.edu.in  (after DNS + host nginx + certbot)
 # Docker direct: http://<server-ip>:8092
@@ -47,7 +47,7 @@ services:
     container_name: pg_cl_backend
     restart: unless-stopped
     env_file:
-      - ./backend/.env.hostinger
+      - ./backend/.env
     environment:
       PORT: "4000"
       MONGO_URI: mongodb://mongo:27017/pg_tracking
