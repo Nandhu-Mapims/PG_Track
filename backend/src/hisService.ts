@@ -1,4 +1,7 @@
-import { HisError } from "./hisErrors";
+import {
+  departmentSharesCanonicalKey,
+  normalizeDepartmentKey,
+} from "./departmentAliases";
 import { hisEnv } from "./hisEnv";
 import {
   fetchIpPatDetailsFromEmr,
@@ -7,6 +10,7 @@ import {
   isEmrZPatientRow,
 } from "./hisQueryBuilder";
 import { getHisPool, sql } from "./hisSql";
+import { HisError } from "./hisErrors";
 
 export { HisError };
 
@@ -352,11 +356,49 @@ export type HisSearchFilters = {
   reg_no?: string;
   date_from?: string;
   date_to?: string;
+  dept_id?: string;
+  dept_name?: string;
   /** Limit results to IP admissions, OP admissions, or both (default all). */
   visit_type?: HisVisitType;
   page?: number;
   page_size?: number;
 };
+
+function departmentMatchesFilter(
+  rowDeptName: string,
+  rowDeptId: string,
+  filterName: string,
+  filterId: string,
+): boolean {
+  if (!filterName && !filterId) return true;
+  const id = filterId.trim();
+  const rowId = rowDeptId.trim();
+  if (id && rowId && id === rowId) return true;
+  if (!filterName.trim()) return !id;
+  const rowName = rowDeptName.trim();
+  if (!rowName) return false;
+  if (departmentSharesCanonicalKey(rowName, filterName)) return true;
+  const rowKey = normalizeDepartmentKey(rowName);
+  const filterKey = normalizeDepartmentKey(filterName);
+  if (!rowKey || !filterKey) return false;
+  return rowKey === filterKey || rowKey.includes(filterKey) || filterKey.includes(rowKey);
+}
+
+async function resolveSearchDeptId(deptId: string, deptName: string): Promise<string> {
+  if (deptId.trim()) return deptId.trim();
+  if (!deptName.trim() || !hisEnv.sqlConfigured) return "";
+  try {
+    const rows = await fetchHisDepartments();
+    const hit = rows.find(
+      (row) =>
+        departmentSharesCanonicalKey(row.dept_name, deptName) ||
+        normalizeDepartmentKey(row.dept_name) === normalizeDepartmentKey(deptName),
+    );
+    return hit?.dept_id ?? "";
+  } catch {
+    return "";
+  }
+}
 
 function parseFilterDate(value: string): Date | null {
   const trimmed = String(value ?? "").trim();
@@ -522,15 +564,18 @@ function emptyHisSearchResult(page = 1, pageSize = HIS_SEARCH_PAGE_SIZE_DEFAULT)
 async function searchHisPatientsViaEmr(filters: HisSearchFilters): Promise<HisSearchResult> {
   const name = String(filters.name ?? "").trim();
   const regNo = String(filters.reg_no ?? "").trim();
+  const deptName = String(filters.dept_name ?? "").trim();
+  const deptId = await resolveSearchDeptId(String(filters.dept_id ?? "").trim(), deptName);
   const visitType: HisVisitType = filters.visit_type ?? "all";
   const { page, pageSize } = resolveSearchPagination(filters);
   const { from, to } = resolveEmrSearchDateRange(filters);
 
-  const cacheKey = `his:search:emr:v2:${JSON.stringify({ name, regNo, from: from.toISOString(), to: to.toISOString(), visitType })}`;
+  const cacheKey = `his:search:emr:v3:${JSON.stringify({ name, regNo, deptName, deptId, from: from.toISOString(), to: to.toISOString(), visitType })}`;
   const cached = getCache(cacheKey);
   if (cached) return paginateHisSearchRows((cached as HisSearchCacheEntry).allRows, page, pageSize);
 
   try {
+    const emrDeptId = deptId || "0";
     const batchDefs: { type: "IP" | "OP"; promise: Promise<Record<string, unknown>[]> }[] = [];
     if (visitType === "IP" || visitType === "all") {
       batchDefs.push({
@@ -539,13 +584,14 @@ async function searchHisPatientsViaEmr(filters: HisSearchFilters): Promise<HisSe
           optoip: "0",
           ipno: regNo,
           patname: name,
+          depid: emrDeptId,
         }),
       });
     }
     if (visitType === "OP" || visitType === "all") {
       batchDefs.push({
         type: "OP",
-        promise: fetchOpPatDetailsFromEmr(from, to, regNo, name),
+        promise: fetchOpPatDetailsFromEmr(from, to, regNo, name, emrDeptId),
       });
     }
 
@@ -564,6 +610,7 @@ async function searchHisPatientsViaEmr(filters: HisSearchFilters): Promise<HisSe
         if (!patientName.includes(name.toUpperCase())) continue;
       }
       const mappedRow = mapEmrPatDetailsToSearchRow(row, type);
+      if (!departmentMatchesFilter(mappedRow.dept_name, mappedRow.dept_id, deptName, deptId)) continue;
       const dedupeKey = `${mappedRow.type}:${mappedRow.visit_id}`;
       if (!mappedRow.visit_id || seen.has(dedupeKey)) continue;
       seen.add(dedupeKey);
@@ -591,9 +638,13 @@ export async function searchHisPatients(filters: HisSearchFilters = {}): Promise
   const regNo = String(filters.reg_no ?? "").trim();
   const dateFrom = String(filters.date_from ?? "").trim();
   const dateTo = String(filters.date_to ?? "").trim();
+  const deptName = String(filters.dept_name ?? "").trim();
+  const deptId = String(filters.dept_id ?? "").trim();
   const visitType: HisVisitType = filters.visit_type ?? "all";
 
-  if (!name && !regNo && !dateFrom && !dateTo) return emptyHisSearchResult(page, pageSize);
+  if (!name && !regNo && !dateFrom && !dateTo && !deptName && !deptId) {
+    return emptyHisSearchResult(page, pageSize);
+  }
 
   if (hisEnv.queryBuilderConfigured) {
     return searchHisPatientsViaEmr(filters);
@@ -601,7 +652,7 @@ export async function searchHisPatients(filters: HisSearchFilters = {}): Promise
 
   if (!hisEnv.sqlConfigured) return emptyHisSearchResult(page, pageSize);
 
-  const cacheKey = `his:search:${JSON.stringify({ name, regNo, dateFrom, dateTo, visitType })}`;
+  const cacheKey = `his:search:${JSON.stringify({ name, regNo, dateFrom, dateTo, deptName, deptId, visitType })}`;
   const cached = getCache(cacheKey);
   if (cached) return paginateHisSearchRows((cached as HisSearchCacheEntry).allRows, page, pageSize);
 
@@ -638,6 +689,13 @@ export async function searchHisPatients(filters: HisSearchFilters = {}): Promise
   if (dateTo) {
     opConds.push("op.dOP_dt <= @dateTo");
     ipConds.push("ip.dIP_dt <= @dateTo");
+  }
+  if (deptId) {
+    opConds.push("CAST(op.iDept_id AS VARCHAR(100)) = @deptId");
+    ipConds.push("CAST(ip.iDept_id AS VARCHAR(100)) = @deptId");
+  } else if (deptName) {
+    opConds.push(`LTRIM(RTRIM(UPPER(${deptNameFromOpExpr}))) LIKE '%' + UPPER(@deptName) + '%'`);
+    ipConds.push(`LTRIM(RTRIM(UPPER(${deptNameFromIpExpr}))) LIKE '%' + UPPER(@deptName) + '%'`);
   }
 
   const opWhere = opConds.length ? `AND ${opConds.join(" AND ")}` : "";
@@ -725,6 +783,8 @@ export async function searchHisPatients(filters: HisSearchFilters = {}): Promise
     if (regNo) request.input("regNo", sql.NVarChar(200), regNo);
     if (dateFrom) request.input("dateFrom", sql.DateTime, new Date(`${dateFrom}T00:00:00`));
     if (dateTo) request.input("dateTo", sql.DateTime, new Date(`${dateTo}T23:59:59.997`));
+    if (deptId) request.input("deptId", sql.NVarChar(100), deptId);
+    if (deptName) request.input("deptName", sql.NVarChar(200), deptName);
   };
 
   try {
@@ -832,6 +892,63 @@ export async function fetchHisDepartments(): Promise<
       message: error instanceof Error ? error.message : "Unknown SQL error",
     });
     throw new HisError("Unable to fetch departments from HIS", 503);
+  }
+}
+
+export type HisDepartmentOption = {
+  dept_id: string;
+  dept_name: string;
+};
+
+/** Full HIS department list for Admission Desk search filter (not limited to PG-tracked departments). */
+export async function fetchHisDepartmentSearchOptions(): Promise<HisDepartmentOption[]> {
+  if (!hisEnv.enabled) return [];
+
+  const cacheKey = "his:department-options";
+  const cached = getCache(cacheKey);
+  if (cached) return cached as HisDepartmentOption[];
+
+  if (hisEnv.sqlConfigured) {
+    try {
+      const rows = await fetchHisDepartments();
+      const mapped = rows
+        .map((row) => ({ dept_id: row.dept_id, dept_name: row.dept_name }))
+        .filter((row) => row.dept_name);
+      setCache(cacheKey, mapped, CACHE_TTL.DEPARTMENTS);
+      return mapped;
+    } catch {
+      /* fall through to EMR discovery */
+    }
+  }
+
+  if (!hisEnv.queryBuilderConfigured) return [];
+
+  const to = new Date();
+  const from = new Date(to);
+  from.setDate(from.getDate() - 30);
+
+  try {
+    const [ipRows, opRows] = await Promise.all([
+      fetchPatDetailsFromEmr(from, to, { optoip: "0" }),
+      fetchOpPatDetailsFromEmr(from, to),
+    ]);
+    const seen = new Map<string, HisDepartmentOption>();
+    for (const row of [...ipRows, ...opRows]) {
+      if (isEmrZPatientRow(row)) continue;
+      const deptName = readRowValue(row, ["DEPARTMENT", "DEPT_NAME"]).trim();
+      if (!deptName) continue;
+      const key = normalizeDepartmentKey(deptName);
+      if (!seen.has(key)) seen.set(key, { dept_id: "", dept_name: deptName });
+    }
+    const mapped = [...seen.values()].sort((a, b) => a.dept_name.localeCompare(b.dept_name));
+    setCache(cacheKey, mapped, 60 * 60 * 1000);
+    return mapped;
+  } catch (error: unknown) {
+    if (error instanceof HisError) throw error;
+    console.error("EMR department option discovery failed", {
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
+    throw new HisError("Unable to fetch HIS department list", 503);
   }
 }
 

@@ -1,15 +1,6 @@
 import mongoose from "mongoose";
-import {
-  Admission,
-  Department,
-  DischargeSummary,
-  PatientAssignment,
-  PGActivityLog,
-  PGMaster,
-  Procedure,
-  ProgressNote,
-  User,
-} from "./models";
+import { Department, User } from "./models";
+import { deleteUserAccount } from "./userDeleteService";
 
 export function normalizeDepartmentKey(name: string): string {
   return String(name ?? "")
@@ -39,16 +30,7 @@ export async function resolvePediatricsDepartmentAlias(): Promise<{
 }
 
 async function removePgUserAndRelatedData(userId: mongoose.Types.ObjectId) {
-  await Promise.all([
-    PGActivityLog.deleteMany({ $or: [{ pgId: userId }, { createdBy: userId }] }),
-    ProgressNote.deleteMany({ pgId: userId }),
-    Procedure.deleteMany({ pgId: userId }),
-    PatientAssignment.deleteMany({ pgId: userId }),
-    DischargeSummary.deleteMany({ preparedBy: userId }),
-    Admission.updateMany({ assignedPgId: userId }, { $set: { assignedPgId: null } }),
-  ]);
-  await PGMaster.deleteMany({ userId });
-  await User.deleteOne({ _id: userId });
+  await deleteUserAccount(userId);
 }
 
 /**

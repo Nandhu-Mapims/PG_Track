@@ -20,6 +20,7 @@ import {
   toObjectId,
 } from "./models";
 import { AuthRequest, auditLogger, authMiddleware, requireAssignmentManager, requireRoles, signToken } from "./middleware";
+import { deleteUserAccount } from "./userDeleteService";
 import { registerHisRoutes } from "./hisRoutes";
 import { resolveDepartmentFromHis } from "./hisDepartmentResolve";
 import {
@@ -36,6 +37,7 @@ import {
   formatTimelineWhen,
   renderPgActivityReportPdf,
 } from "./pgActivityPdf";
+import { buildPatientTimeline } from "./patientTimelineService";
 
 export const apiRouter = Router();
 registerHisRoutes(apiRouter);
@@ -158,7 +160,8 @@ apiRouter.post("/auth/login", async (req: Request, res: Response) => {
     username: user.get("username"),
     role: user.get("role"),
   });
-  return res.json({ token, user });
+  const safeUser = await User.findById(user.id).select("-password").lean();
+  return res.json({ token, user: safeUser });
 });
 
 apiRouter.post("/auth/logout", authMiddleware, (_req: Request, res: Response) => res.json({ message: "Logged out" }));
@@ -366,6 +369,36 @@ apiRouter.patch(
     user.set("password", password);
     await user.save();
     return res.json({ message: "Password updated." });
+  },
+);
+
+apiRouter.delete(
+  "/users/:id",
+  authMiddleware,
+  requireRoles("Admin"),
+  auditLogger("User", "Delete User"),
+  async (req: AuthRequest, res) => {
+    const targetId = req.params.id;
+    if (String(req.user?.id) === String(targetId)) {
+      return res.status(400).json({ message: "You cannot delete your own account." });
+    }
+
+    const user = await User.findById(targetId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    if (user.role === "Admin" && user.status === "Active") {
+      const otherActiveAdmins = await User.countDocuments({
+        role: "Admin",
+        status: "Active",
+        _id: { $ne: user._id },
+      });
+      if (otherActiveAdmins === 0) {
+        return res.status(400).json({ message: "Cannot delete the only active administrator." });
+      }
+    }
+
+    await deleteUserAccount(user._id);
+    return res.json({ message: "User deleted permanently." });
   },
 );
 
@@ -650,14 +683,26 @@ apiRouter.post("/activity", authMiddleware, auditLogger("Activity", "Log Activit
   let assignment = null;
   if (assignmentId) {
     assignment = await PatientAssignment.findById(assignmentId);
-  } else {
-    assignment = await PatientAssignment.findOne({ patientId, pgId, isActive: true }).sort({ assignedAt: -1 });
+  } else if (patientId) {
+    const actorPgId = req.user?.role === "PG" ? req.user.id : pgId;
+    if (actorPgId) {
+      assignment = await PatientAssignment.findOne({ patientId, pgId: actorPgId, isActive: true }).sort({ assignedAt: -1 });
+    }
+    if (!assignment) {
+      assignment = await PatientAssignment.findOne({ patientId, isActive: true, isPrimary: true }).sort({ assignedAt: -1 });
+    }
+    if (!assignment) {
+      assignment = await PatientAssignment.findOne({ patientId, isActive: true }).sort({ assignedAt: -1 });
+    }
   }
-  if (!assignment) return res.status(400).json({ message: "No active assignment found for this patient and PG" });
+  if (!assignment) return res.status(400).json({ message: "No active allocation found for this patient." });
+
+  const activityPgId =
+    req.user?.role === "PG" && req.user.id ? req.user.id : pgId || String(assignment.get("pgId"));
 
   const entry = await PGActivityLog.create({
     patientId,
-    pgId,
+    pgId: activityPgId,
     assignmentId: assignment.id,
     activityTypeId,
     activityType: activityType || type.get("name"),
@@ -678,21 +723,7 @@ apiRouter.get("/patient-timeline/:id", authMiddleware, async (req, res) => {
   if (!exists) {
     return res.status(404).json({ message: "Patient not found. Create an admission first or pick another patient." });
   }
-  const [admissions, activities, procedures, notes, discharge] = await Promise.all([
-    Admission.find({ patientId }).lean(),
-    PGActivityLog.find({ patientId }).lean(),
-    Procedure.find({ patientId }).lean(),
-    ProgressNote.find({ patientId }).lean(),
-    DischargeSummary.findOne({ patientId }).lean(),
-  ]);
-  const timeline = [
-    ...admissions.map((a) => ({ at: a.createdAt, type: "Admission", data: a })),
-    ...(await PatientAssignment.find({ patientId }).lean()).map((a) => ({ at: a.assignedAt, type: "Assignment", data: a })),
-    ...activities.map((a) => ({ at: a.createdAt, type: "Activity", data: a })),
-    ...procedures.map((p) => ({ at: p.date, type: "Procedure", data: p })),
-    ...notes.map((n) => ({ at: n.noteDateTime, type: "ProgressNote", data: n })),
-    ...(discharge ? [{ at: discharge.updatedAt, type: "Discharge", data: discharge }] : []),
-  ].sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+  const timeline = await buildPatientTimeline(patientId);
   res.json(timeline);
 });
 
@@ -722,14 +753,18 @@ apiRouter.get("/dashboard/pg/:pgId", authMiddleware, async (req, res) => {
   const pgId = req.params.pgId;
   const today = localDayRange(0);
   const yesterday = localDayRange(-1);
-  const [myPatients, myActivities, procedureCount, pendingTasks, activitiesToday, activitiesYesterday, assignmentsToday, assignmentsYesterday] =
+  const activityDayFilter = (range: { start: Date; end: Date }) => ({
+    pgId,
+    createdAt: { $gte: range.start, $lt: range.end },
+  });
+  const [myPatients, myActivities, procedureCount, pendingTasks, activitiesTodayIds, activitiesYesterdayIds, assignmentsToday, assignmentsYesterday] =
     await Promise.all([
       PatientAssignment.countDocuments({ pgId, isActive: true }),
       PGActivityLog.countDocuments({ pgId }),
       Procedure.countDocuments({ pgId }),
       ProgressNote.countDocuments({ pgId, delayedEntry: true }),
-      PGActivityLog.countDocuments({ pgId, createdAt: { $gte: today.start, $lt: today.end } }),
-      PGActivityLog.countDocuments({ pgId, createdAt: { $gte: yesterday.start, $lt: yesterday.end } }),
+      PGActivityLog.distinct("patientId", activityDayFilter(today)),
+      PGActivityLog.distinct("patientId", activityDayFilter(yesterday)),
       PatientAssignment.countDocuments({ pgId, assignedAt: { $gte: today.start, $lt: today.end } }),
       PatientAssignment.countDocuments({ pgId, assignedAt: { $gte: yesterday.start, $lt: yesterday.end } }),
     ]);
@@ -738,8 +773,8 @@ apiRouter.get("/dashboard/pg/:pgId", authMiddleware, async (req, res) => {
     myActivities,
     procedureCount,
     pendingTasks,
-    activitiesToday,
-    activitiesYesterday,
+    activitiesToday: activitiesTodayIds.length,
+    activitiesYesterday: activitiesYesterdayIds.length,
     assignmentsToday,
     assignmentsYesterday,
   });
@@ -947,6 +982,69 @@ apiRouter.patch("/assignments/:id/release", authMiddleware, requireAssignmentMan
   return res.json(assignment);
 });
 
+apiRouter.patch(
+  "/assignments/:id/reallocate",
+  authMiddleware,
+  requireAssignmentManager,
+  auditLogger("Assignment", "Reallocate Assignment"),
+  async (req: AuthRequest, res) => {
+    const assignment = await PatientAssignment.findById(req.params.id);
+    if (!assignment) return res.status(404).json({ message: "Assignment not found" });
+    if (!assignment.get("isActive")) {
+      return res.status(400).json({ message: "This allocation is no longer active." });
+    }
+
+    const { pgId, shift, remarks, icuTag } = req.body as Record<string, unknown>;
+    const newPgId = String(pgId || "").trim();
+    if (!newPgId) return res.status(400).json({ message: "Select a PG to reallocate to." });
+    if (String(assignment.get("pgId")) === newPgId) {
+      return res.status(400).json({ message: "Patient is already allocated to this PG." });
+    }
+
+    const wasPrimary = Boolean(assignment.get("isPrimary"));
+    const patientId = assignment.get("patientId");
+
+    assignment.set("isActive", false);
+    assignment.set("releasedAt", new Date());
+    const priorRemarks = String(assignment.get("remarks") || "").trim();
+    assignment.set("remarks", priorRemarks ? `${priorRemarks} | Reallocated` : "Reallocated to another PG");
+    await assignment.save();
+
+    const latestAdmission = await Admission.findOne({ patientId }).sort({ createdAt: -1 });
+    if (!latestAdmission) {
+      return res.status(400).json({ message: "No admission found for this patient. Complete Admission Desk entry first." });
+    }
+
+    if (wasPrimary) {
+      await PatientAssignment.updateMany({ patientId, isActive: true, isPrimary: true }, { $set: { isPrimary: false } });
+    }
+
+    const newAssignment = await PatientAssignment.create({
+      admissionId: latestAdmission._id,
+      patientId,
+      pgId: newPgId,
+      departmentId: assignment.get("departmentId") || latestAdmission.get("departmentId"),
+      unitId: assignment.get("unitId") || latestAdmission.get("unitId"),
+      consultantId: assignment.get("consultantId") || latestAdmission.get("consultantId"),
+      shift: shift ? normalizeShift(String(shift)) : assignment.get("shift"),
+      assignmentType: wasPrimary ? "Primary" : assignment.get("assignmentType"),
+      isPrimary: wasPrimary,
+      assignedAt: new Date(),
+      isActive: true,
+      assignedBy: req.user?.id,
+      remarks: remarks ? String(remarks) : "Reallocated — covering PG absence or workload shift",
+      icuTag: icuTag !== undefined ? Boolean(icuTag) : Boolean(assignment.get("icuTag")),
+    });
+
+    if (wasPrimary) {
+      await Admission.findByIdAndUpdate(latestAdmission._id, { assignedPgId: newPgId });
+    }
+
+    const populated = await PatientAssignment.findById(newAssignment._id).populate("pgId unitId consultantId");
+    return res.json(populated);
+  },
+);
+
 apiRouter.patch("/assignments/:id/primary", authMiddleware, requireAssignmentManager, auditLogger("Assignment", "Set Primary Assignment"), async (req, res) => {
   const assignment = await PatientAssignment.findById(req.params.id);
   if (!assignment) return res.status(404).json({ message: "Assignment not found" });
@@ -985,14 +1083,30 @@ apiRouter.get("/assignments/live-board", authMiddleware, async (_req, res) => {
   });
   const patientIds = admissions.map((a) => String(a.patientId?._id || a.patientId));
 
-  const [assignments, lastActivities] = await Promise.all([
+  const [assignments, lastActivities, inactiveAssignments] = await Promise.all([
     PatientAssignment.find({ patientId: { $in: patientIds }, isActive: true }).populate("pgId unitId consultantId").lean(),
     PGActivityLog.aggregate([
       { $match: { patientId: { $in: patientIds.map((p) => toObjectId(String(p))) } } },
       { $sort: { createdAt: -1 } },
       { $group: { _id: "$patientId", lastActivityAt: { $first: "$createdAt" } } },
     ]),
+    PatientAssignment.find({ patientId: { $in: patientIds }, isActive: false, releasedAt: { $ne: null } })
+      .sort({ releasedAt: -1 })
+      .populate("pgId")
+      .lean(),
   ]);
+
+  const previousPgByPatient = new Map<string, { id: string; name: string }>();
+  for (const row of inactiveAssignments) {
+    const pid = String(row.patientId);
+    if (previousPgByPatient.has(pid)) continue;
+    const pg = row.pgId as { _id?: unknown; fullName?: string; username?: string } | null;
+    if (!pg?._id) continue;
+    previousPgByPatient.set(pid, {
+      id: String(pg._id),
+      name: String(pg.fullName || pg.username || "PG"),
+    });
+  }
 
   const activityMap = new Map(lastActivities.map((x) => [String(x._id), x.lastActivityAt]));
   const assignmentMap = assignments.reduce<Record<string, any[]>>((acc, row) => {
@@ -1006,6 +1120,19 @@ apiRouter.get("/assignments/live-board", authMiddleware, async (_req, res) => {
   const data = admissions.map((a) => {
     const patientId = String(a.patientId?._id || a.patientId);
     const activeAssignments = assignmentMap[patientId] || [];
+    const primaryAssignment = activeAssignments.find((x) => x.isPrimary) || activeAssignments[0];
+    const managingPg = primaryAssignment
+      ? {
+          id: (primaryAssignment.pgId as { _id?: unknown })?._id,
+          name: (primaryAssignment.pgId as { fullName?: string })?.fullName,
+          assignmentId: String(primaryAssignment._id),
+        }
+      : null;
+    const previousCandidate = previousPgByPatient.get(patientId);
+    const previousPg =
+      previousCandidate && managingPg?.id && String(previousCandidate.id) !== String(managingPg.id)
+        ? previousCandidate
+        : null;
     const lastActivityAt = activityMap.get(patientId) || null;
     const hoursSinceReview = lastActivityAt ? Math.floor((now - new Date(lastActivityAt).getTime()) / (1000 * 60 * 60)) : null;
     const hasIcu = activeAssignments.some((x) => x.icuTag);
@@ -1024,11 +1151,14 @@ apiRouter.get("/assignments/live-board", authMiddleware, async (_req, res) => {
       unit: (a.unitId as any)?.name || null,
       consultant: (a.consultantId as any)?.fullName || null,
       assignedPgs: activeAssignments.map((x) => ({
+        assignmentId: String(x._id),
         id: x.pgId?._id,
         name: x.pgId?.fullName,
         isPrimary: x.isPrimary,
         shift: x.shift,
       })),
+      managingPg,
+      previousPg,
       lastActivityAt,
       hoursSinceReview,
       isIcu: hasIcu || Boolean(a.icuTag),

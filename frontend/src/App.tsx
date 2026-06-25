@@ -124,6 +124,12 @@ type PgWorkspacePatient = {
   statusTone: PgPatientStatusTone;
   isIcu: boolean;
   hoursSinceReview: number | null;
+  isMine: boolean;
+  isManagingPg: boolean;
+  managingPgId: string;
+  managingPgName: string;
+  previousPgName: string;
+  ownershipLabel: string;
 };
 
 type PgCompletedCase = {
@@ -463,6 +469,82 @@ function HelpPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   );
 }
 
+type FeedbackDialogProps = {
+  open: boolean;
+  variant: "success" | "error";
+  title: string;
+  message: string;
+  onClose: () => void;
+};
+
+function FeedbackDialog({ open, variant, title, message, onClose }: FeedbackDialogProps) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open || variant !== "success") return;
+    const timer = window.setTimeout(onClose, 4500);
+    return () => window.clearTimeout(timer);
+  }, [open, variant, onClose]);
+
+  if (!open) return null;
+
+  const isSuccess = variant === "success";
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/50 p-4 backdrop-blur-[2px]"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="feedback-dialog-title"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="w-full max-w-sm rounded-2xl border border-slate-200/80 bg-white/95 p-6 shadow-[0_24px_64px_-12px_rgba(15,23,42,0.2)] backdrop-blur-xl"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div
+          className={`mx-auto flex h-14 w-14 items-center justify-center rounded-full ${
+            isSuccess ? "bg-emerald-50 ring-1 ring-emerald-200/90" : "bg-red-50 ring-1 ring-red-200/90"
+          }`}
+        >
+          {isSuccess ? (
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} className="h-7 w-7 text-emerald-600" aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+          ) : (
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} className="h-7 w-7 text-red-600" aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+            </svg>
+          )}
+        </div>
+        <h3 id="feedback-dialog-title" className="mt-4 text-center text-lg font-semibold tracking-tight text-slate-900">
+          {title}
+        </h3>
+        <p className="mt-2 text-center text-sm leading-relaxed text-slate-600">{message}</p>
+        <button
+          type="button"
+          className={`mt-6 w-full rounded-xl px-4 py-2.5 text-sm font-medium text-white transition ${
+            isSuccess ? "bg-teal-700 hover:bg-teal-800" : "bg-slate-800 hover:bg-slate-900"
+          }`}
+          onClick={onClose}
+        >
+          OK
+        </button>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 type AlertItem = {
   id: string;
   severity: "warning" | "info" | "critical";
@@ -551,8 +633,73 @@ type LiveBoardRow = {
   status?: string;
   hoursSinceReview?: number | null;
   isIcu?: boolean;
-  assignedPgs?: Array<{ id?: string; name?: string; isPrimary?: boolean }>;
+  assignedPgs?: Array<{ assignmentId?: string; id?: string; name?: string; isPrimary?: boolean; shift?: string }>;
+  managingPg?: { id?: string; name?: string; assignmentId?: string } | null;
+  previousPg?: { id?: string; name?: string } | null;
 };
+
+function getPrimaryPgFromBoardRow(row: LiveBoardRow) {
+  const list = row.assignedPgs || [];
+  return list.find((pg) => pg.isPrimary) || list[0] || null;
+}
+
+function allocatedLiveBoardRows(board: unknown[]): LiveBoardRow[] {
+  return (Array.isArray(board) ? board : []).filter(
+    (row) =>
+      (row as LiveBoardRow).status !== "Unassigned" &&
+      Array.isArray((row as LiveBoardRow).assignedPgs) &&
+      ((row as LiveBoardRow).assignedPgs?.length || 0) > 0,
+  ) as LiveBoardRow[];
+}
+
+function mapLiveBoardRowToPgWorkspacePatient(row: LiveBoardRow, viewerPgId: string): PgWorkspacePatient {
+  const primary = getPrimaryPgFromBoardRow(row);
+  const managingPgId = String(row.managingPg?.id || primary?.id || "");
+  const managingPgName = String(row.managingPg?.name || primary?.name || "—");
+  const previousPgName = String(row.previousPg?.name || "");
+  const isMine = isPgAssignedToRow(row, viewerPgId);
+  const isManagingPg = managingPgId === viewerPgId;
+  const ownershipLabel = isManagingPg
+    ? "You manage"
+    : isMine
+      ? "You assist"
+      : "Colleague patient";
+  const statusMeta = getPgPatientStatus(row);
+  return {
+    patientId: String(row.patientId),
+    patientName: row.patientName || "Unknown Patient",
+    ipNumber: row.ipNumber || "—",
+    wardBedNumber: (row as { wardBedNumber?: string }).wardBedNumber || "—",
+    department: (row as { department?: string }).department || "—",
+    unit: (row as { unit?: string }).unit || "—",
+    consultant: (row as { consultant?: string }).consultant || "—",
+    lastReviewAt: (row as { lastActivityAt?: string | null }).lastActivityAt || null,
+    lastReviewLabel: formatRelativeTimestamp((row as { lastActivityAt?: string | null }).lastActivityAt),
+    statusLabel: statusMeta.statusLabel,
+    statusTone: statusMeta.statusTone,
+    isIcu: Boolean(row.isIcu),
+    hoursSinceReview: typeof row.hoursSinceReview === "number" ? row.hoursSinceReview : null,
+    isMine,
+    isManagingPg,
+    managingPgId,
+    managingPgName,
+    previousPgName,
+    ownershipLabel,
+  };
+}
+
+function mapBoardToPgPatientOptions(rows: LiveBoardRow[], viewerPgId?: string) {
+  return rows.map((row) => {
+    const primary = getPrimaryPgFromBoardRow(row);
+    return {
+      _id: row.patientId,
+      patientName: row.patientName,
+      ipNumber: row.ipNumber,
+      managingPgName: primary?.name || row.managingPg?.name || "—",
+      isMine: viewerPgId ? isPgAssignedToRow(row, viewerPgId) : false,
+    };
+  });
+}
 
 function isPgAssignedToRow(row: LiveBoardRow, pgId: string): boolean {
   return Array.isArray(row.assignedPgs) && row.assignedPgs.some((pg) => String(pg.id) === pgId);
@@ -823,7 +970,7 @@ const navItems: NavItem[] = [
 
 const pgNavItems: NavItem[] = [
   { to: "/dashboard/pg", label: "Dashboard", section: "My Workspace" },
-  { to: "/my-patients", label: "My Patients", section: "My Workspace" },
+  { to: "/my-patients", label: "Patients", section: "My Workspace" },
   { to: "/activity", label: "Activities", section: "My Workspace" },
   { to: "/timeline", label: "Patient Timeline", section: "My Workspace" },
   { to: "/completed-cases", label: "Completed Cases", section: "My Workspace" },
@@ -863,15 +1010,16 @@ function HeaderQuickSearch() {
       void api
         .get("/assignments/live-board")
         .then((res) => {
-          const rows = Array.isArray(res.data) ? res.data : [];
-          const mine = rows
-            .filter((row: any) => Array.isArray(row.assignedPgs) && row.assignedPgs.some((pg: any) => String(pg.id) === String(user._id)))
-            .map((row: any) => ({
-              _id: row.patientId,
+          const rows = allocatedLiveBoardRows(res.data);
+          setPatients(
+            mapBoardToPgPatientOptions(rows, String(user._id)).map((row) => ({
+              _id: row._id,
               patientName: row.patientName,
               ipNumber: row.ipNumber,
-            }));
-          setPatients(mine);
+              managingPgName: row.managingPgName,
+              isMine: row.isMine,
+            })),
+          );
           setPgs([]);
           setLoaded(true);
         })
@@ -911,7 +1059,7 @@ function HeaderQuickSearch() {
   return (
     <div ref={wrapRef} className="relative w-full md:w-auto">
       <input
-        placeholder={user?.role === "PG" ? "Search my patients by name or IP…" : "Search patients & PGs…"}
+        placeholder={user?.role === "PG" ? "Search allocated patients by name or IP…" : "Search patients & PGs…"}
         className={`${user?.role === "PG" ? "w-full sm:w-80" : "w-80"} rounded-full border border-slate-200/90 bg-white/90 px-4 py-2.5 text-sm shadow-inner shadow-slate-900/5 outline-none ring-teal-500/0 transition placeholder:text-slate-400 focus:border-teal-500/50 focus:bg-white focus:ring-4 focus:ring-teal-500/15`}
         value={q}
         onChange={(e) => {
@@ -1106,6 +1254,7 @@ function LoginPage() {
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    setError("");
     try {
       const { data } = await api.post("/auth/login", { username, password });
       localStorage.setItem("token", data.token);
@@ -1118,8 +1267,12 @@ function LoginPage() {
       }
       dispatch(setAuth({ token: data.token, user: profile }));
       navigate("/dashboard/pg");
-    } catch {
-      setError("Login failed. Check credentials.");
+    } catch (err: any) {
+      if (!err?.response) {
+        setError("Cannot reach the API server. Start the backend on port 4000 and MongoDB, then try again.");
+        return;
+      }
+      setError(err?.response?.data?.message || "Login failed. Check username and password.");
     }
   };
 
@@ -1642,7 +1795,6 @@ function AppLayout({ children, title, subtitle }: { children: ReactNode; title: 
 }
 
 function MastersPage() {
-  const user = useSelector((s: RootState) => s.auth.user);
   const [departments, setDepartments] = useState<any[]>([]);
   const [units, setUnits] = useState<any[]>([]);
   const [activityTypes, setActivityTypes] = useState<any[]>([]);
@@ -1909,119 +2061,59 @@ function MastersPage() {
       ) : null}
       {loading ? <div className="text-sm text-slate-500">Loading master data…</div> : null}
       {loadError ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{loadError}</div> : null}
-      <div className="rounded-2xl border border-slate-200/70 bg-white/95 p-5 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <h3 className="text-sm font-semibold text-slate-900">Quick add master data</h3>
-            <p className="mt-1 text-xs text-slate-500">
-              Use these buttons when a required department, unit, or activity type is missing during workflow entry.
-            </p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button type="button" className={uiBtnOutline} onClick={() => (activeCreateForm === "department" ? setActiveCreateForm(null) : openDepartmentForm())}>
-              Add Department
-            </button>
-            <button type="button" className={uiBtnOutline} onClick={() => (activeCreateForm === "unit" ? setActiveCreateForm(null) : openUnitForm())}>
-              Add Unit
-            </button>
-            <button type="button" className={uiBtnOutline} onClick={() => (activeCreateForm === "activity" ? setActiveCreateForm(null) : openActivityTypeForm())}>
-              Add Activity Type
-            </button>
-          </div>
-        </div>
-
-        {activeCreateForm === "department" ? (
-          <div className="mt-4 grid gap-3 md:grid-cols-3">
-            <input
-              className={uiField}
-              placeholder="Department name"
-              value={departmentForm.name}
-              onChange={(e) => setDepartmentForm((prev) => ({ ...prev, name: e.target.value }))}
-            />
-            <input
-              className={uiField}
-              placeholder="Code (auto if blank)"
-              value={departmentForm.code}
-              onChange={(e) => setDepartmentForm((prev) => ({ ...prev, code: e.target.value.toUpperCase() }))}
-            />
-            <input
-              className={uiField}
-              placeholder="HOD name (optional)"
-              value={departmentForm.hodName}
-              onChange={(e) => setDepartmentForm((prev) => ({ ...prev, hodName: e.target.value }))}
-            />
-            <div className="md:col-span-3">
-              <button type="button" className="rounded-lg bg-teal-700 px-4 py-2 text-sm text-white hover:bg-teal-800 disabled:opacity-50" onClick={() => void submitDepartment()} disabled={submitting}>
-                {submitting ? "Saving…" : editingDepartmentId ? "Save Department" : "Create Department"}
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        {activeCreateForm === "unit" ? (
-          <div className="mt-4 grid gap-3 md:grid-cols-3">
-            <input
-              className={uiField}
-              placeholder="Unit name"
-              value={unitForm.name}
-              onChange={(e) => setUnitForm((prev) => ({ ...prev, name: e.target.value }))}
-            />
-            <select
-              className={uiField}
-              value={unitForm.departmentId}
-              onChange={(e) => setUnitForm((prev) => ({ ...prev, departmentId: e.target.value }))}
-            >
-              <option value="">Select Department</option>
-              {departments
-                .filter((d: any) => d.status !== "Inactive")
-                .map((d: any) => (
-                  <option key={String(d._id)} value={String(d._id)}>
-                    {d.name}
-                  </option>
-                ))}
-            </select>
-            <div className="flex items-end">
-              <button type="button" className="rounded-lg bg-teal-700 px-4 py-2 text-sm text-white hover:bg-teal-800 disabled:opacity-50" onClick={() => void submitUnit()} disabled={submitting}>
-                {submitting ? "Saving…" : editingUnitId ? "Save Unit" : "Create Unit"}
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        {activeCreateForm === "activity" ? (
-          <div className="mt-4 grid gap-3 md:grid-cols-[2fr_1fr_auto]">
-            <input
-              className={uiField}
-              placeholder="Activity type name"
-              value={activityTypeForm.name}
-              onChange={(e) => setActivityTypeForm((prev) => ({ ...prev, name: e.target.value }))}
-            />
-            <select
-              className={uiField}
-              value={activityTypeForm.status}
-              onChange={(e) => setActivityTypeForm((prev) => ({ ...prev, status: e.target.value }))}
-            >
-              <option value="Active">Active</option>
-              <option value="Inactive">Inactive</option>
-            </select>
-            <div className="flex items-end">
-              <button type="button" className="rounded-lg bg-teal-700 px-4 py-2 text-sm text-white hover:bg-teal-800 disabled:opacity-50" onClick={() => void submitActivityType()} disabled={submitting}>
-                {submitting ? "Saving…" : editingActivityTypeId ? "Save Activity Type" : "Create Activity Type"}
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        {submitMessage ? <p className="mt-3 text-sm text-slate-600">{submitMessage}</p> : null}
-        <p className="mt-2 text-xs text-slate-500">Logged in as {user?.role || "User"}.</p>
-      </div>
+      {submitMessage ? (
+        <div className="rounded-xl border border-slate-200/80 bg-slate-50/90 px-4 py-3 text-sm text-slate-700">{submitMessage}</div>
+      ) : null}
       <div className="grid gap-4 md:grid-cols-3">
         <KPI title="Departments" value={departments.length} />
         <KPI title="Units" value={units.length} />
         <KPI title="Activity Types" value={activityTypes.length} />
       </div>
       <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
-        <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">Department Registry</div>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-4 py-3">
+          <div className="text-sm font-semibold">Department Registry</div>
+          <button
+            type="button"
+            className={uiBtnOutlineSm}
+            onClick={() => (activeCreateForm === "department" ? setActiveCreateForm(null) : openDepartmentForm())}
+          >
+            {activeCreateForm === "department" && !editingDepartmentId ? "Cancel" : "Add Department"}
+          </button>
+        </div>
+        {activeCreateForm === "department" ? (
+          <div className="border-b border-slate-200 bg-slate-50/60 px-4 py-3">
+            <div className="grid gap-3 md:grid-cols-3">
+              <input
+                className={uiField}
+                placeholder="Department name"
+                value={departmentForm.name}
+                onChange={(e) => setDepartmentForm((prev) => ({ ...prev, name: e.target.value }))}
+              />
+              <input
+                className={uiField}
+                placeholder="Code (auto if blank)"
+                value={departmentForm.code}
+                onChange={(e) => setDepartmentForm((prev) => ({ ...prev, code: e.target.value.toUpperCase() }))}
+              />
+              <input
+                className={uiField}
+                placeholder="HOD name (optional)"
+                value={departmentForm.hodName}
+                onChange={(e) => setDepartmentForm((prev) => ({ ...prev, hodName: e.target.value }))}
+              />
+              <div className="md:col-span-3">
+                <button
+                  type="button"
+                  className="rounded-lg bg-teal-700 px-4 py-2 text-sm text-white hover:bg-teal-800 disabled:opacity-50"
+                  onClick={() => void submitDepartment()}
+                  disabled={submitting}
+                >
+                  {submitting ? "Saving…" : editingDepartmentId ? "Save Department" : "Create Department"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
         <div className={uiTableScroll}>
         <table className="w-full min-w-[480px] text-sm">
           <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
@@ -2058,7 +2150,52 @@ function MastersPage() {
         <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
       </div>
       <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
-        <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">Unit Mapping</div>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-4 py-3">
+          <div className="text-sm font-semibold">Unit Mapping</div>
+          <button
+            type="button"
+            className={uiBtnOutlineSm}
+            onClick={() => (activeCreateForm === "unit" ? setActiveCreateForm(null) : openUnitForm())}
+          >
+            {activeCreateForm === "unit" && !editingUnitId ? "Cancel" : "Add Unit"}
+          </button>
+        </div>
+        {activeCreateForm === "unit" ? (
+          <div className="border-b border-slate-200 bg-slate-50/60 px-4 py-3">
+            <div className="grid gap-3 md:grid-cols-3">
+              <input
+                className={uiField}
+                placeholder="Unit name"
+                value={unitForm.name}
+                onChange={(e) => setUnitForm((prev) => ({ ...prev, name: e.target.value }))}
+              />
+              <select
+                className={uiField}
+                value={unitForm.departmentId}
+                onChange={(e) => setUnitForm((prev) => ({ ...prev, departmentId: e.target.value }))}
+              >
+                <option value="">Select Department</option>
+                {departments
+                  .filter((d: any) => d.status !== "Inactive")
+                  .map((d: any) => (
+                    <option key={String(d._id)} value={String(d._id)}>
+                      {d.name}
+                    </option>
+                  ))}
+              </select>
+              <div className="flex items-end">
+                <button
+                  type="button"
+                  className="rounded-lg bg-teal-700 px-4 py-2 text-sm text-white hover:bg-teal-800 disabled:opacity-50"
+                  onClick={() => void submitUnit()}
+                  disabled={submitting}
+                >
+                  {submitting ? "Saving…" : editingUnitId ? "Save Unit" : "Create Unit"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
         <div className={uiTableScroll}>
         <table className="w-full min-w-[640px] text-sm">
           <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
@@ -2097,7 +2234,46 @@ function MastersPage() {
         <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
       </div>
       <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
-        <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">Activity types</div>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-4 py-3">
+          <div className="text-sm font-semibold">Activity types</div>
+          <button
+            type="button"
+            className={uiBtnOutlineSm}
+            onClick={() => (activeCreateForm === "activity" ? setActiveCreateForm(null) : openActivityTypeForm())}
+          >
+            {activeCreateForm === "activity" && !editingActivityTypeId ? "Cancel" : "Add Activity Type"}
+          </button>
+        </div>
+        {activeCreateForm === "activity" ? (
+          <div className="border-b border-slate-200 bg-slate-50/60 px-4 py-3">
+            <div className="grid gap-3 md:grid-cols-[2fr_1fr_auto]">
+              <input
+                className={uiField}
+                placeholder="Activity type name"
+                value={activityTypeForm.name}
+                onChange={(e) => setActivityTypeForm((prev) => ({ ...prev, name: e.target.value }))}
+              />
+              <select
+                className={uiField}
+                value={activityTypeForm.status}
+                onChange={(e) => setActivityTypeForm((prev) => ({ ...prev, status: e.target.value }))}
+              >
+                <option value="Active">Active</option>
+                <option value="Inactive">Inactive</option>
+              </select>
+              <div className="flex items-end">
+                <button
+                  type="button"
+                  className="rounded-lg bg-teal-700 px-4 py-2 text-sm text-white hover:bg-teal-800 disabled:opacity-50"
+                  onClick={() => void submitActivityType()}
+                  disabled={submitting}
+                >
+                  {submitting ? "Saving…" : editingActivityTypeId ? "Save Activity Type" : "Create Activity Type"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
         <div className={uiTableScroll}>
         <table className="w-full min-w-[360px] text-sm">
           <thead className="bg-gradient-to-r from-slate-100 to-teal-50/35 text-left text-xs font-semibold uppercase tracking-wide text-slate-600">
@@ -2167,6 +2343,14 @@ function buildHisPageList(current: number, total: number): (number | "gap")[] {
   return result;
 }
 
+function hisRowMatchesDepartmentFilter(row: { dept_name?: string; department?: string }, deptName: string): boolean {
+  const filterName = deptName.trim();
+  if (!filterName) return true;
+  const rowDept = String(row.dept_name ?? row.department ?? "").trim();
+  if (!rowDept) return false;
+  return departmentsAlign(rowDept, filterName);
+}
+
 function AdmissionPage() {
   const [form, setForm] = useState({
     ipNumber: "",
@@ -2178,6 +2362,7 @@ function AdmissionPage() {
     unitId: "",
   });
   const [departments, setDepartments] = useState<any[]>([]);
+  const [hisDepartmentOptions, setHisDepartmentOptions] = useState<{ dept_id: string; dept_name: string }[]>([]);
   const [units, setUnits] = useState<any[]>([]);
   const [message, setMessage] = useState("");
 
@@ -2187,9 +2372,11 @@ function AdmissionPage() {
     name: "",
     date_from: "",
     date_to: "",
+    dept_name: "",
+    dept_id: "",
     visit_type: "IP" as "IP" | "OP" | "all",
   });
-  const [hisRows, setHisRows] = useState<any[]>([]);
+  const [hisRowsAll, setHisRowsAll] = useState<any[]>([]);
   const [hisCounts, setHisCounts] = useState<{ ip: number; op: number; total: number; showing: number } | null>(
     null,
   );
@@ -2216,10 +2403,53 @@ function AdmissionPage() {
       .catch(() => setHisActive(false));
   }, []);
 
+  useEffect(() => {
+    if (!hisActive) {
+      setHisDepartmentOptions([]);
+      return;
+    }
+    void api
+      .get("/his/department-options")
+      .then((r) => setHisDepartmentOptions(Array.isArray(r.data) ? r.data : []))
+      .catch(() => setHisDepartmentOptions([]));
+  }, [hisActive]);
+
+  const hisDepartmentOptionsMerged = useMemo(() => {
+    const seen = new Map<string, { dept_id: string; dept_name: string }>();
+    for (const d of hisDepartmentOptions) {
+      if (d.dept_name) seen.set(d.dept_name, d);
+    }
+    for (const row of hisRowsAll) {
+      const name = String(row.dept_name ?? row.department ?? "").trim();
+      if (!name) continue;
+      if (!seen.has(name)) seen.set(name, { dept_id: String(row.dept_id ?? ""), dept_name: name });
+    }
+    return [...seen.values()].sort((a, b) => a.dept_name.localeCompare(b.dept_name));
+  }, [hisDepartmentOptions, hisRowsAll]);
+
+  const displayHisRows = useMemo(() => {
+    const deptName = hisSearch.dept_name.trim();
+    if (!deptName) return hisRowsAll;
+    return hisRowsAll.filter((row) => hisRowMatchesDepartmentFilter(row, deptName));
+  }, [hisRowsAll, hisSearch.dept_name]);
+
+  const displayHisCounts = useMemo(() => {
+    if (!hisRowsAll.length) return null;
+    const ip = displayHisRows.filter((r) => r.type === "IP").length;
+    const op = displayHisRows.filter((r) => r.type === "OP").length;
+    return {
+      ip,
+      op,
+      total: displayHisRows.length,
+      showing: displayHisRows.length,
+      loaded: hisRowsAll.length,
+    };
+  }, [hisRowsAll, displayHisRows]);
+
   const runHisSearch = async (page = 1) => {
     setHisError("");
     setHisLoading(true);
-    setHisRows([]);
+    setHisRowsAll([]);
     setHisCounts(null);
     try {
       const { data } = await api.post("/his/search", {
@@ -2247,7 +2477,7 @@ function AdmissionPage() {
           };
       const totalPages = Array.isArray(data) ? 1 : Math.max(1, Number(data?.totalPages ?? 1));
       const currentPage = Array.isArray(data) ? 1 : Math.max(1, Number(data?.page ?? page));
-      setHisRows(rows);
+      setHisRowsAll(rows);
       setHisCounts(counts.total > 0 ? counts : null);
       setHisPage(currentPage);
       setHisTotalPages(totalPages);
@@ -2256,7 +2486,7 @@ function AdmissionPage() {
       }
     } catch (e: any) {
       setHisError(e?.response?.data?.message || "HIS search failed.");
-      setHisRows([]);
+      setHisRowsAll([]);
       setHisCounts(null);
       setHisPage(1);
       setHisTotalPages(1);
@@ -2400,6 +2630,26 @@ function AdmissionPage() {
           <div className="mt-2 flex flex-wrap items-center gap-3">
             <select
               className={uiFieldCompact}
+              value={hisSearch.dept_name}
+              onChange={(e) => {
+                const deptName = e.target.value;
+                const selected = hisDepartmentOptionsMerged.find((d) => d.dept_name === deptName);
+                setHisSearch((s) => ({
+                  ...s,
+                  dept_name: deptName,
+                  dept_id: selected?.dept_id ? String(selected.dept_id) : "",
+                }));
+              }}
+            >
+              <option value="">All departments</option>
+              {hisDepartmentOptionsMerged.map((d) => (
+                <option key={d.dept_name} value={d.dept_name}>
+                  {d.dept_name}
+                </option>
+              ))}
+            </select>
+            <select
+              className={uiFieldCompact}
               value={hisSearch.visit_type}
               onChange={(e) =>
                 setHisSearch((s) => ({ ...s, visit_type: e.target.value as "IP" | "OP" | "all" }))
@@ -2422,7 +2672,12 @@ function AdmissionPage() {
             </button>
           </div>
           {hisError ? <p className="mt-2 text-sm text-amber-800">{hisError}</p> : null}
-          {hisRows.length > 0 ? (
+          {hisSearch.dept_name && hisRowsAll.length > 0 && displayHisRows.length === 0 ? (
+            <p className="mt-2 text-sm text-amber-800">
+              No patients in {hisSearch.dept_name} for this search. Try All departments or change the date range.
+            </p>
+          ) : null}
+          {displayHisRows.length > 0 ? (
             <div className="mt-3 max-h-56 overflow-auto rounded-xl border border-slate-200 bg-white">
               <table className="w-full min-w-[640px] text-left text-xs">
                 <thead className="sticky top-0 bg-slate-100 font-semibold text-slate-700">
@@ -2437,7 +2692,7 @@ function AdmissionPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {hisRows.map((row, i) => (
+                  {displayHisRows.map((row, i) => (
                     <tr key={`${row.patient_id}-${row.visit_id}-${i}`} className="border-t border-slate-100">
                       <td className="px-2 py-1.5">{row.type}</td>
                       <td className="px-2 py-1.5 font-mono">{row.visit_id}</td>
@@ -2506,17 +2761,27 @@ function AdmissionPage() {
               </span>
             </div>
           ) : null}
-          {hisCounts ? (
+          {displayHisCounts ? (
             <p className="mt-2 text-sm text-slate-600">
-              <span className="font-semibold text-slate-800">IP:</span> {hisCounts.ip.toLocaleString()}
+              <span className="font-semibold text-slate-800">IP:</span> {displayHisCounts.ip.toLocaleString()}
               <span className="mx-2 text-slate-300">|</span>
-              <span className="font-semibold text-slate-800">OP:</span> {hisCounts.op.toLocaleString()}
+              <span className="font-semibold text-slate-800">OP:</span> {displayHisCounts.op.toLocaleString()}
               <span className="mx-2 text-slate-300">|</span>
-              <span className="font-semibold text-slate-800">Total:</span> {hisCounts.total.toLocaleString()}
-              {hisTotalPages > 1 ? (
+              <span className="font-semibold text-slate-800">Total:</span> {displayHisCounts.total.toLocaleString()}
+              {hisSearch.dept_name ? (
                 <span className="text-slate-500">
                   {" "}
-                  · {hisCounts.showing.toLocaleString()} on this page ({HIS_SEARCH_PAGE_SIZE} per page)
+                  · filtered by {hisSearch.dept_name}
+                  {displayHisCounts.loaded > displayHisCounts.total
+                    ? ` (${displayHisCounts.loaded.toLocaleString()} loaded)`
+                    : ""}
+                </span>
+              ) : null}
+              {!hisSearch.dept_name && hisTotalPages > 1 ? (
+                <span className="text-slate-500">
+                  {" "}
+                  · {(hisCounts?.showing ?? displayHisCounts.showing).toLocaleString()} on this page ({HIS_SEARCH_PAGE_SIZE}{" "}
+                  per page)
                 </span>
               ) : null}
             </p>
@@ -2709,6 +2974,54 @@ function ResidentAllocationPatientCard({
   );
 }
 
+function ResidentAllocationAssignedPatientCard({
+  row,
+  selected,
+  onSelect,
+}: {
+  row: any;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const ward = row.wardBedNumber?.trim() || "—";
+  const dept = row.department?.trim() || "—";
+  const admitted = formatAdmissionCompact(row.admissionDate);
+  const pgLabel =
+    (row.assignedPgs || [])
+      .map((p: any) => `${p.name || "PG"}${p.isPrimary ? " (Primary)" : ""}`)
+      .join(", ") || "—";
+
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`w-full rounded-lg border px-2 py-1.5 text-left transition focus:outline-none focus:ring-2 focus:ring-teal-500/30 ${
+        selected
+          ? "border-teal-500 bg-teal-50/90 ring-1 ring-teal-500/20"
+          : "border-slate-200 bg-white hover:border-teal-200 hover:bg-teal-50/35"
+      }`}
+      aria-pressed={selected}
+    >
+      <div className="flex items-center justify-between gap-1.5">
+        <span className="min-w-0 truncate text-xs font-semibold leading-tight text-slate-900">{row.patientName ?? "Patient"}</span>
+        <div className="flex shrink-0 items-center gap-0.5">
+          {row.isIcu ? (
+            <span className="rounded bg-rose-100 px-1 py-px text-[9px] font-bold uppercase text-rose-800">ICU</span>
+          ) : null}
+          {selected ? <span className="rounded bg-teal-600 px-1 py-px text-[9px] font-semibold text-white">✓</span> : null}
+        </div>
+      </div>
+      <p className="mt-0.5 truncate text-[10px] leading-snug text-slate-500">
+        IP {row.ipNumber ?? "—"} · {ward} · {dept}
+      </p>
+      <p className="mt-0.5 flex items-center justify-between gap-1 text-[10px] leading-snug">
+        <span className="min-w-0 truncate tabular-nums text-slate-500">{admitted}</span>
+        <span className="shrink-0 font-medium text-indigo-700">→ {pgLabel}</span>
+      </p>
+    </button>
+  );
+}
+
 function AssignmentPage() {
   const [board, setBoard] = useState<any[]>([]);
   const [pgs, setPgs] = useState<any[]>([]);
@@ -2722,9 +3035,11 @@ function AssignmentPage() {
   const [patientSearch, setPatientSearch] = useState("");
   const [pgSearch, setPgSearch] = useState("");
   const [pgYearFilter, setPgYearFilter] = useState("");
+  const [patientListMode, setPatientListMode] = useState<"assign" | "reallocate">("assign");
   const [form, setForm] = useState({
     patientId: "",
     pgId: "",
+    reallocateAssignmentId: "",
     shift: "General" as "Morning" | "Evening" | "Night" | "General",
     isPrimary: true,
     remarks: "",
@@ -2785,27 +3100,54 @@ function AssignmentPage() {
       setMessage("Choose both a patient and a PG.");
       return;
     }
+    if (patientListMode === "reallocate" && !form.reallocateAssignmentId) {
+      setMessage("Select an allocated patient to reallocate.");
+      return;
+    }
     setMessage("");
     try {
-      await api.post("/assignments", {
-        patientId: form.patientId,
-        pgId: form.pgId,
-        shift: form.shift,
-        isPrimary: form.isPrimary,
-        remarks: form.remarks || undefined,
-        icuTag: form.icuTag,
-      });
-      setMessage("PG assigned. Dashboard will refresh on next load.");
+      if (patientListMode === "reallocate") {
+        await api.patch(`/assignments/${form.reallocateAssignmentId}/reallocate`, {
+          pgId: form.pgId,
+          shift: form.shift,
+          remarks: form.remarks || undefined,
+          icuTag: form.icuTag,
+        });
+        setMessage("Patient reallocated to the new PG.");
+      } else {
+        await api.post("/assignments", {
+          patientId: form.patientId,
+          pgId: form.pgId,
+          shift: form.shift,
+          isPrimary: form.isPrimary,
+          remarks: form.remarks || undefined,
+          icuTag: form.icuTag,
+        });
+        setMessage("PG assigned. Dashboard will refresh on next load.");
+      }
       await load();
       if (historyPatientId) await loadHistory(historyPatientId);
-      setForm((prev) => ({ ...prev, patientId: "", remarks: "", icuTag: false }));
+      setForm((prev) => ({
+        ...prev,
+        patientId: "",
+        pgId: "",
+        reallocateAssignmentId: "",
+        remarks: "",
+        icuTag: false,
+      }));
     } catch (err: any) {
       const apiMessage = typeof err?.response?.data?.message === "string" ? err.response.data.message : "";
-      setMessage(apiMessage || "Assignment failed. Ensure the patient has an active admission.");
+      setMessage(
+        apiMessage ||
+          (patientListMode === "reallocate"
+            ? "Reallocation failed."
+            : "Assignment failed. Ensure the patient has an active admission."),
+      );
     }
   };
 
   const unassigned = board.filter((row) => row.status === "Unassigned");
+  const assigned = board.filter((row) => row.status !== "Unassigned" && (row.assignedPgs || []).length > 0);
   const normalizedPatientSearch = patientSearch.trim().toLowerCase();
   const normalizedPgSearch = pgSearch.trim().toLowerCase();
   const pgYearOptions = useMemo(
@@ -2826,13 +3168,35 @@ function AssignmentPage() {
       .map((value) => String(value).toLowerCase());
     return values.some((value) => value.includes(normalizedPatientSearch));
   });
+  const filteredAssigned = assigned.filter((row) => {
+    if (!normalizedPatientSearch) return true;
+    const values = [
+      row.patientName,
+      row.ipNumber,
+      row.patientId,
+      row.wardBedNumber,
+      row.department,
+      ...(row.assignedPgs || []).map((p: any) => p.name),
+    ]
+      .filter(Boolean)
+      .map((value) => String(value).toLowerCase());
+    return values.some((value) => value.includes(normalizedPatientSearch));
+  });
+  const activePatientRows = patientListMode === "assign" ? filteredUnassigned : filteredAssigned;
+  const activePatientTotal = patientListMode === "assign" ? unassigned.length : assigned.length;
   const selectedPatientRow = form.patientId
     ? board.find((row) => String(row.patientId) === form.patientId)
     : null;
+  const currentAllocation =
+    selectedPatientRow && patientListMode === "reallocate"
+      ? (selectedPatientRow.assignedPgs || []).find((p: any) => p.isPrimary) || (selectedPatientRow.assignedPgs || [])[0]
+      : null;
+  const currentPgId = currentAllocation?.id ? String(currentAllocation.id) : "";
   const patientDeptName = String(selectedPatientRow?.department || "").trim();
 
   const filteredPgs = pgs
     .filter((pg) => {
+      if (patientListMode === "reallocate" && currentPgId && String(pg._id) === currentPgId) return false;
       const matchesYear = !pgYearFilter || String(pg.yearOfResidency || "") === pgYearFilter;
       const values = [pg.fullName, pg.email, pg.username, pgDepartmentName(pg)]
         .filter(Boolean)
@@ -2850,38 +3214,78 @@ function AssignmentPage() {
   const workloadForPg = (pgId: string, pgName: string) =>
     workloadByPgId.get(String(pgId)) ?? emptyWorkloadRow(pgId, pgName);
 
-  const releaseAssignment = async (assignmentId: string) => {
-    setMessage("");
-    try {
-      await api.patch(`/assignments/${assignmentId}/release`, {});
-      setMessage("Assignment released.");
-      await load();
-      await loadHistory(historyPatientId);
-    } catch (err: any) {
-      const apiMessage = typeof err?.response?.data?.message === "string" ? err.response.data.message : "";
-      setMessage(apiMessage || "Release failed.");
-    }
+  const selectPatientForAssign = (row: any) => {
+    const id = String(row.patientId);
+    setForm((prev) => ({ ...prev, patientId: id, pgId: "", reallocateAssignmentId: "" }));
+  };
+
+  const selectPatientForReallocate = (row: any) => {
+    const id = String(row.patientId);
+    const primary =
+      (row.assignedPgs || []).find((p: any) => p.isPrimary) || (row.assignedPgs || [])[0];
+    setForm((prev) => ({
+      ...prev,
+      patientId: id,
+      pgId: "",
+      reallocateAssignmentId: primary?.assignmentId ? String(primary.assignmentId) : "",
+    }));
   };
 
   return (
     <AppLayout
       title="Resident Allocation"
-      subtitle="Assign admitted patients to available PGs. Adjust allocations when PGs are absent or workload shifts — operations visible on the live board."
+      subtitle="Assign new patients or reallocate to another PG when the current resident is absent."
     >
-      <div className="rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm p-5">
-        <h3 className="text-sm font-semibold text-slate-900">Assign a PG</h3>
+      <div className="rounded-2xl border border-slate-200/70 bg-white/95 p-5 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
+        <h3 className="text-sm font-semibold text-slate-900">
+          {patientListMode === "assign" ? "Assign a PG" : "Reallocate patient"}
+        </h3>
         <p className="mt-1 text-xs text-slate-500">
-          Patients must already be admitted. Pick an unassigned patient and a PG, set shift options below, then{" "}
-          <span className="font-medium text-slate-700">Assign</span>.
+          {patientListMode === "assign"
+            ? "Pick an unassigned patient and a PG, then Assign."
+            : "Pick an allocated patient, choose the covering PG, then Reallocate — the previous allocation is closed automatically."}
         </p>
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+              patientListMode === "assign"
+                ? "bg-teal-700 text-white"
+                : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+            }`}
+            onClick={() => {
+              setPatientListMode("assign");
+              setForm((prev) => ({ ...prev, patientId: "", pgId: "", reallocateAssignmentId: "" }));
+            }}
+          >
+            New assignment
+          </button>
+          <button
+            type="button"
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+              patientListMode === "reallocate"
+                ? "bg-teal-700 text-white"
+                : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+            }`}
+            onClick={() => {
+              setPatientListMode("reallocate");
+              setForm((prev) => ({ ...prev, patientId: "", pgId: "", reallocateAssignmentId: "" }));
+            }}
+          >
+            Reallocate (PG absent)
+          </button>
+        </div>
 
         <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200/90 bg-slate-50/40">
           <div className="grid grid-cols-1 divide-y divide-slate-200 lg:grid-cols-2 lg:divide-x lg:divide-y-0">
             <div className="flex min-h-[min(320px,48vh)] flex-col p-3">
               <div className="flex items-center justify-between gap-2 border-b border-slate-200/80 pb-1.5">
-                <span className="text-[11px] font-semibold tracking-wider text-slate-600">UNASSIGNED PATIENTS</span>
+                <span className="text-[11px] font-semibold tracking-wider text-slate-600">
+                  {patientListMode === "assign" ? "UNASSIGNED PATIENTS" : "ALLOCATED PATIENTS"}
+                </span>
                 <span className="rounded-full bg-slate-200/80 px-2 py-0.5 text-[11px] font-medium tabular-nums text-slate-700">
-                  {loading ? "…" : normalizedPatientSearch ? `${filteredUnassigned.length}/${unassigned.length}` : unassigned.length}
+                  {loading ? "…" : normalizedPatientSearch ? `${activePatientRows.length}/${activePatientTotal}` : activePatientTotal}
                 </span>
               </div>
               <input
@@ -2894,16 +3298,18 @@ function AssignmentPage() {
               <div className="mt-2 min-h-0 flex-1 space-y-1 overflow-y-auto pr-0.5 [-ms-overflow-style:none] [scrollbar-width:thin]">
                 {loading ? (
                   <p className="text-[11px] text-slate-500">Loading patients…</p>
-                ) : unassigned.length === 0 ? (
+                ) : activePatientTotal === 0 ? (
                   <p className="rounded-lg border border-dashed border-slate-200 bg-white/80 px-2 py-4 text-center text-[11px] text-slate-500">
-                    No unassigned patients on the board. Admit from Admission Desk or release an assignment below.
+                    {patientListMode === "assign"
+                      ? "No unassigned patients on the board. Admit from Admission Desk or use Reallocate for assigned patients."
+                      : "No allocated patients on the board."}
                   </p>
-                ) : filteredUnassigned.length === 0 ? (
+                ) : activePatientRows.length === 0 ? (
                   <p className="rounded-lg border border-dashed border-slate-200 bg-white/80 px-2 py-4 text-center text-[11px] text-slate-500">
                     No patients match this search.
                   </p>
-                ) : (
-                  filteredUnassigned.map((row) => {
+                ) : patientListMode === "assign" ? (
+                  activePatientRows.map((row) => {
                     const id = String(row.patientId);
                     const selected = form.patientId === id;
                     return (
@@ -2911,7 +3317,20 @@ function AssignmentPage() {
                         key={id}
                         row={row}
                         selected={selected}
-                        onSelect={() => setForm((prev) => ({ ...prev, patientId: id }))}
+                        onSelect={() => selectPatientForAssign(row)}
+                      />
+                    );
+                  })
+                ) : (
+                  activePatientRows.map((row) => {
+                    const id = String(row.patientId);
+                    const selected = form.patientId === id;
+                    return (
+                      <ResidentAllocationAssignedPatientCard
+                        key={id}
+                        row={row}
+                        selected={selected}
+                        onSelect={() => selectPatientForReallocate(row)}
                       />
                     );
                   })
@@ -2922,11 +3341,15 @@ function AssignmentPage() {
             <div className="flex min-h-[min(280px,42vh)] flex-col p-4">
               <div className="flex items-center justify-between gap-2 border-b border-slate-200/80 pb-2">
                 <div>
-                  <span className="text-[11px] font-semibold tracking-wider text-slate-600">AVAILABLE PGs</span>
+                  <span className="text-[11px] font-semibold tracking-wider text-slate-600">
+                    {patientListMode === "reallocate" ? "SELECT NEW PG" : "AVAILABLE PGs"}
+                  </span>
                   <p className="mt-1 text-[11px] text-slate-500">
-                    {patientDeptName
-                      ? `Showing PGs in ${patientDeptName}. Pick a patient first to narrow the list.`
-                      : "Filter by name, department, or year. Colour shows current workload."}
+                    {patientListMode === "reallocate"
+                      ? "Choose the covering PG. The current PG is hidden from this list."
+                      : patientDeptName
+                        ? `Showing PGs in ${patientDeptName}. Pick a patient first to narrow the list.`
+                        : "Filter by name, department, or year. Colour shows current workload."}
                   </p>
                 </div>
                 <span className="rounded-full bg-slate-200/80 px-2 py-0.5 text-[11px] font-medium tabular-nums text-slate-700">
@@ -3003,10 +3426,16 @@ function AssignmentPage() {
           <p className={uiInfoBar}>
             <span className="font-medium text-slate-800">Selection:</span>{" "}
             {form.patientId
-              ? (unassigned.find((r) => String(r.patientId) === form.patientId)?.patientName ?? "Patient")
+              ? (board.find((r) => String(r.patientId) === form.patientId)?.patientName ?? "Patient")
               : "—"}{" "}
+            {patientListMode === "reallocate" && currentAllocation?.name ? (
+              <>
+                <span className="text-slate-400">from</span>{" "}
+                <span className="font-medium text-indigo-800">{currentAllocation.name}</span>{" "}
+              </>
+            ) : null}
             <span className="text-slate-400">→</span>{" "}
-            {form.pgId && selectedPg ? pgOptionLabel(selectedPg) : "—"}
+            {form.pgId && selectedPg ? pgOptionLabel(selectedPg) : patientListMode === "reallocate" ? "select new PG" : "—"}
           </p>
         )}
 
@@ -3023,7 +3452,12 @@ function AssignmentPage() {
           </select>
         </div>
         <label className="mt-3 flex cursor-pointer items-center gap-2 text-sm text-slate-700">
-          <input type="checkbox" checked={form.isPrimary} onChange={(e) => setForm((prev) => ({ ...prev, isPrimary: e.target.checked }))} />
+          <input
+            type="checkbox"
+            checked={form.isPrimary}
+            disabled={patientListMode === "reallocate"}
+            onChange={(e) => setForm((prev) => ({ ...prev, isPrimary: e.target.checked }))}
+          />
           Primary PG (clears previous primary on this patient)
         </label>
         <label className="mt-2 flex cursor-pointer items-center gap-2 text-sm text-slate-700">
@@ -3032,18 +3466,18 @@ function AssignmentPage() {
         </label>
         <textarea
           className={uiTextarea("mt-3 h-20")}
-          placeholder="Optional remarks"
+          placeholder={patientListMode === "reallocate" ? "Optional remarks (e.g. PG 1 on leave)" : "Optional remarks"}
           value={form.remarks}
           onChange={(e) => setForm((prev) => ({ ...prev, remarks: e.target.value }))}
         />
         <div className="mt-3 flex flex-wrap gap-2">
           <button
             type="button"
-            disabled={!form.patientId || !form.pgId}
+            disabled={!form.patientId || !form.pgId || (patientListMode === "reallocate" && !form.reallocateAssignmentId)}
             className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-50"
             onClick={() => void assign()}
           >
-            Assign
+            {patientListMode === "reallocate" ? "Reallocate" : "Assign"}
           </button>
           <button type="button" className={uiBtnOutline} onClick={() => void load()} disabled={loading}>
             Refresh board
@@ -3053,9 +3487,9 @@ function AssignmentPage() {
       </div>
 
       <div className="rounded-2xl border border-slate-200/70 bg-white/95 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm p-5">
-        <h3 className="text-sm font-semibold text-slate-900">Assignment history & release</h3>
+        <h3 className="text-sm font-semibold text-slate-900">Assignment history</h3>
         <p className="mt-1 text-xs text-slate-500">
-          Pick any admitted patient from the live board (below). Active rows can be released without deleting history.
+          Audit trail for each patient. Use <span className="font-medium text-slate-700">Reallocate (PG absent)</span> above to move a patient to another PG.
         </p>
         <select
           className={uiTextarea("mt-3 max-w-md md:max-w-xl")}
@@ -3085,7 +3519,6 @@ function AssignmentPage() {
                   <th className="px-3 py-2">Primary</th>
                   <th className="px-3 py-2">Status</th>
                   <th className="px-3 py-2">Assigned</th>
-                  <th className="px-3 py-2">Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -3103,24 +3536,11 @@ function AssignmentPage() {
                       {h.isActive ? (
                         <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700">Active</span>
                       ) : (
-                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">Released</span>
+                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">Reallocated / ended</span>
                       )}
                     </td>
                     <td className="px-3 py-2 text-xs text-slate-600">
                       {h.assignedAt ? new Date(h.assignedAt).toLocaleString() : "—"}
-                    </td>
-                    <td className="px-3 py-2">
-                      {h.isActive ? (
-                        <button
-                          type="button"
-                          className="rounded border border-amber-300 px-2 py-1 text-xs text-amber-900 hover:bg-amber-50"
-                          onClick={() => void releaseAssignment(String(h._id))}
-                        >
-                          Release
-                        </button>
-                      ) : (
-                        <span className="text-xs text-slate-400">—</span>
-                      )}
                     </td>
                   </tr>
                 ))}
@@ -3205,8 +3625,8 @@ function ResidentAllocationPage() {
       <div className="rounded-2xl border border-slate-200/70 bg-white/95 p-6 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
         <p className="text-sm leading-relaxed text-slate-700">
           Only users with the <strong className="text-slate-900">Head of Department</strong> or{" "}
-          <strong className="text-slate-900">Administrator</strong> role can assign patients to postgraduate residents,
-          release allocations, or set primary PGs. Your Head of Department allocates patients to available PGs when others are absent.
+          <strong className="text-slate-900">Administrator</strong> role can assign patients to postgraduate residents or
+          reallocate them when a PG is absent.
         </p>
       </div>
     </AppLayout>
@@ -3236,16 +3656,12 @@ function PgSummaryCard({
 
 function PgPatientCard({
   row,
-  busy,
   onOpenTimeline,
   onAddNote,
-  onMarkReviewed,
 }: {
   row: PgWorkspacePatient;
-  busy?: boolean;
   onOpenTimeline: () => void;
   onAddNote: () => void;
-  onMarkReviewed: () => void;
 }) {
   const tone = pgStatusMeta(row.statusTone);
   return (
@@ -3259,6 +3675,19 @@ function PgPatientCard({
               <p className="mt-1 text-sm text-slate-500">IP {row.ipNumber}</p>
             </div>
             <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${tone.chip}`}>{row.statusLabel}</span>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <span
+              className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                row.isManagingPg
+                  ? "bg-teal-50 text-teal-800 ring-1 ring-teal-200/80"
+                  : row.isMine
+                    ? "bg-indigo-50 text-indigo-800 ring-1 ring-indigo-200/80"
+                    : "bg-slate-100 text-slate-700 ring-1 ring-slate-200/80"
+              }`}
+            >
+              {row.ownershipLabel}
+            </span>
           </div>
           <div className="mt-3 grid gap-2 text-sm text-slate-600 sm:grid-cols-2">
             <div>
@@ -3274,6 +3703,16 @@ function PgPatientCard({
               <p className="mt-1">{row.unit}</p>
             </div>
             <div>
+              <span className="text-xs font-medium uppercase tracking-wide text-slate-400">Managing PG</span>
+              <p className="mt-1">{row.managingPgName}</p>
+            </div>
+            {row.previousPgName ? (
+              <div>
+                <span className="text-xs font-medium uppercase tracking-wide text-slate-400">Previously allocated</span>
+                <p className="mt-1">{row.previousPgName}</p>
+              </div>
+            ) : null}
+            <div>
               <span className="text-xs font-medium uppercase tracking-wide text-slate-400">Last Review</span>
               <p className="mt-1">{row.lastReviewLabel}</p>
             </div>
@@ -3284,14 +3723,6 @@ function PgPatientCard({
             </button>
             <button type="button" className={uiBtnOutlineSm} onClick={onAddNote}>
               Add Note
-            </button>
-            <button
-              type="button"
-              className="rounded-lg bg-teal-700 px-3 py-1 text-xs font-semibold text-white transition hover:bg-teal-800 disabled:opacity-50"
-              onClick={onMarkReviewed}
-              disabled={busy}
-            >
-              {busy ? "Saving..." : "Mark Reviewed"}
             </button>
           </div>
         </div>
@@ -3329,27 +3760,11 @@ function usePgWorkspaceData(pgId?: string) {
       const patientNameById = new Map<string, { patientName?: string; ipNumber?: string }>(
         ((patientRes.data?.data || []) as any[]).map((row) => [String(row._id), row]),
       );
-      const mine = (Array.isArray(boardRes.data) ? boardRes.data : [])
-        .filter((row: any) => Array.isArray(row.assignedPgs) && row.assignedPgs.some((pg: any) => String(pg.id) === String(pgId)))
-        .map((row: any) => {
-          const statusMeta = getPgPatientStatus(row);
-          return {
-            patientId: String(row.patientId),
-            patientName: row.patientName || "Unknown Patient",
-            ipNumber: row.ipNumber || "—",
-            wardBedNumber: row.wardBedNumber || "—",
-            department: row.department || "—",
-            unit: row.unit || "—",
-            consultant: row.consultant || "—",
-            lastReviewAt: row.lastActivityAt || null,
-            lastReviewLabel: formatRelativeTimestamp(row.lastActivityAt),
-            statusLabel: statusMeta.statusLabel,
-            statusTone: statusMeta.statusTone,
-            isIcu: Boolean(row.isIcu),
-            hoursSinceReview: typeof row.hoursSinceReview === "number" ? row.hoursSinceReview : null,
-          } as PgWorkspacePatient;
-        })
-        .sort((a: PgWorkspacePatient, b: PgWorkspacePatient) => {
+      const boardRows = allocatedLiveBoardRows(boardRes.data);
+      const allPatients = boardRows
+        .map((row) => mapLiveBoardRowToPgWorkspacePatient(row, String(pgId)))
+        .sort((a, b) => {
+          if (a.isMine !== b.isMine) return a.isMine ? -1 : 1;
           const rank = { red: 0, orange: 1, green: 2 };
           return rank[a.statusTone] - rank[b.statusTone] || a.patientName.localeCompare(b.patientName);
         });
@@ -3361,7 +3776,7 @@ function usePgWorkspaceData(pgId?: string) {
       }));
 
       setStats(statsRes.data || {});
-      setPatients(mine);
+      setPatients(allPatients);
       setActivities(recent);
       setCompletedCases(Array.isArray(completedRes.data) ? completedRes.data : []);
       setActivityTypes(typesRes.data || []);
@@ -3384,14 +3799,14 @@ function usePgWorkspaceData(pgId?: string) {
     [activities],
   );
 
-  const reviewActivityTypeId = useMemo(() => {
-    const preferred = ["Consultant Round", "ICU Review", "Progress Note"];
-    for (const name of preferred) {
-      const match = activityTypes.find((row: any) => String(row.name).toLowerCase() === name.toLowerCase());
-      if (match?._id) return String(match._id);
+  const todayPatientsReviewed = useMemo(() => {
+    const patientIds = new Set<string>();
+    for (const row of todayActivities) {
+      const patientId = row.patientId ? String(row.patientId) : "";
+      if (patientId) patientIds.add(patientId);
     }
-    return "";
-  }, [activityTypes]);
+    return patientIds.size;
+  }, [todayActivities]);
 
   const noteActivityTypeId = useMemo(() => {
     const preferred = ["Progress Note", "Consultant Round"];
@@ -3405,12 +3820,13 @@ function usePgWorkspaceData(pgId?: string) {
   return {
     stats,
     patients,
+    myPatients: patients.filter((row) => row.isMine),
     todayActivities,
+    todayPatientsReviewed,
     completedCases,
     loading,
     error,
     refresh,
-    reviewActivityTypeId,
     noteActivityTypeId,
   };
 }
@@ -3420,57 +3836,43 @@ function MyPatientsPage() {
   const user = useSelector((s: RootState) => s.auth.user);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
-  const [message, setMessage] = useState("");
-  const [busyPatientId, setBusyPatientId] = useState("");
-  const { patients, loading, error, refresh, reviewActivityTypeId, noteActivityTypeId } = usePgWorkspaceData(user?._id);
+  const [ownershipFilter, setOwnershipFilter] = useState<"all" | "mine" | "colleagues">("all");
+  const { patients, myPatients, loading, error, noteActivityTypeId } = usePgWorkspaceData(user?._id);
 
   const filteredPatients = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return patients.filter((row) => {
+      if (ownershipFilter === "mine" && !row.isMine) return false;
+      if (ownershipFilter === "colleagues" && row.isMine) return false;
       const matchesSearch =
         !needle ||
-        [row.patientName, row.ipNumber, row.wardBedNumber, row.department, row.unit]
+        [row.patientName, row.ipNumber, row.wardBedNumber, row.department, row.unit, row.managingPgName, row.previousPgName]
           .filter(Boolean)
           .map((value) => String(value).toLowerCase())
           .some((value) => value.includes(needle));
       const matchesStatus = statusFilter === "All" || row.statusLabel === statusFilter;
       return matchesSearch && matchesStatus;
     });
-  }, [patients, search, statusFilter]);
-
-  const handleMarkReviewed = async (row: PgWorkspacePatient) => {
-    if (!user?._id || !reviewActivityTypeId) {
-      setMessage("A review activity type is not configured yet.");
-      return;
-    }
-    setBusyPatientId(row.patientId);
-    setMessage("");
-    try {
-      await api.post("/activity", {
-        patientId: row.patientId,
-        pgId: user._id,
-        activityTypeId: reviewActivityTypeId,
-        remarks: "Quick review completed from PG dashboard.",
-      });
-      setMessage(`Review recorded for ${row.patientName}.`);
-      await refresh();
-    } catch {
-      setMessage("Could not mark the patient as reviewed right now.");
-    } finally {
-      setBusyPatientId("");
-    }
-  };
+  }, [patients, search, statusFilter, ownershipFilter]);
 
   return (
-    <AppLayout title="My Patients" subtitle="Only your allocated patients are shown here, with the fastest actions used during rounds.">
+    <AppLayout
+      title="Patients"
+      subtitle="View all allocated inpatients — yours and colleagues'. Open timelines or log activities for cover when needed."
+    >
       <section className="rounded-3xl border border-slate-200/80 bg-white/95 p-4 shadow-[0_10px_28px_-18px_rgba(15,23,42,0.18)]">
-        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px]">
+        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px_180px]">
           <input
             className={uiField}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search patient, IP, ward, department, or unit"
+            placeholder="Search patient, IP, ward, department, or PG"
           />
+          <select className={uiField} value={ownershipFilter} onChange={(e) => setOwnershipFilter(e.target.value as typeof ownershipFilter)}>
+            <option value="all">All allocated ({patients.length})</option>
+            <option value="mine">My patients ({myPatients.length})</option>
+            <option value="colleagues">Colleague patients ({Math.max(0, patients.length - myPatients.length)})</option>
+          </select>
           <select className={uiField} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
             <option value="All">All statuses</option>
             <option value="Active">Active</option>
@@ -3478,7 +3880,6 @@ function MyPatientsPage() {
             <option value="Critical">Critical</option>
           </select>
         </div>
-        {message ? <p className="mt-3 text-sm text-slate-600">{message}</p> : null}
       </section>
       {loading ? <div className="rounded-2xl border border-slate-200/70 bg-white/95 p-4 text-sm text-slate-500">Loading your patients…</div> : null}
       {error ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div> : null}
@@ -3492,14 +3893,12 @@ function MyPatientsPage() {
           <PgPatientCard
             key={row.patientId}
             row={row}
-            busy={busyPatientId === row.patientId}
             onOpenTimeline={() => navigate(`/timeline?patient=${row.patientId}`)}
             onAddNote={() =>
               navigate(
                 `/activity?patient=${encodeURIComponent(row.patientId)}${noteActivityTypeId ? `&activityTypeId=${encodeURIComponent(noteActivityTypeId)}` : ""}&preset=note`,
               )
             }
-            onMarkReviewed={() => void handleMarkReviewed(row)}
           />
         ))}
       </div>
@@ -3648,7 +4047,6 @@ function ActivityPage() {
   });
   const [recentActivities, setRecentActivities] = useState<any[]>([]);
   const [message, setMessage] = useState("");
-  const [patientsLoaded, setPatientsLoaded] = useState(false);
   const isPgUser = user?.role === "PG";
   const loggedInPgLabel =
     user?.fullName ||
@@ -3658,7 +4056,6 @@ function ActivityPage() {
 
   useEffect(() => {
     const shouldLoadAssignedBoard = Boolean(isPgUser && user?._id);
-    setPatientsLoaded(false);
     void Promise.all([
       api.get("/patients"),
       api.get("/pg"),
@@ -3673,13 +4070,14 @@ function ActivityPage() {
         setActivityTypes(t.data || []);
 
         if (shouldLoadAssignedBoard) {
-          patientRows = (Array.isArray(board.data) ? board.data : [])
-            .filter((row: any) => Array.isArray(row.assignedPgs) && row.assignedPgs.some((pg: any) => String(pg.id) === String(user?._id)))
-            .map((row: any) => ({
-              _id: row.patientId,
-              patientName: row.patientName,
-              ipNumber: row.ipNumber,
-            }));
+          const rows = allocatedLiveBoardRows(board.data);
+          patientRows = mapBoardToPgPatientOptions(rows, String(user?._id)).map((row) => ({
+            _id: row._id,
+            patientName: row.patientName,
+            ipNumber: row.ipNumber,
+            managingPgName: row.managingPgName,
+            isMine: row.isMine,
+          }));
           setPatients(patientRows);
         } else {
           setPatients(patientRows);
@@ -3691,9 +4089,8 @@ function ActivityPage() {
             ipNumber: patientRows.find((entry: any) => String(entry._id) === String(row.patientId))?.ipNumber || "—",
           })),
         );
-        setPatientsLoaded(true);
       })
-      .catch(() => setPatientsLoaded(true));
+      .catch(() => undefined);
   }, [isPgUser, user?._id]);
 
   useEffect(() => {
@@ -3727,13 +4124,7 @@ function ActivityPage() {
     }
   }, [activityTypes, searchParams]);
 
-  useEffect(() => {
-    if (!isPgUser) return;
-    if (!patientsLoaded) return;
-    if (!form.patientId) return;
-    if (patients.some((patient) => String(patient._id) === String(form.patientId))) return;
-    setForm((prev) => ({ ...prev, patientId: "" }));
-  }, [form.patientId, isPgUser, patients, patientsLoaded]);
+  const myAssignedPatientCount = patients.filter((patient) => patient.isMine).length;
 
   const submitActivity = async (advanceToNext = false) => {
     try {
@@ -3779,7 +4170,7 @@ function ActivityPage() {
         );
       }
     } catch {
-      setMessage("Activity submission failed. Ensure patient and PG have active assignment.");
+      setMessage("Activity submission failed. Ensure the patient has an active PG allocation.");
     }
   };
 
@@ -3789,7 +4180,12 @@ function ActivityPage() {
     <AppLayout title="Activities" subtitle="Quick clinical logging designed for rounds, follow-ups, and bedside updates.">
       {isPgUser ? (
         <div className="grid gap-4 md:grid-cols-3">
-          <PgSummaryCard title="Assigned Patients" value={patients.length} subtitle="Patients currently assigned to you" tone="green" />
+          <PgSummaryCard
+            title="Allocated Patients"
+            value={`${myAssignedPatientCount}/${patients.length}`}
+            subtitle="Your patients / all visible allocated inpatients"
+            tone="green"
+          />
           <PgSummaryCard title="Today’s Activities" value={todaysActivities.length} subtitle="Clinical actions logged in your shift today" tone="orange" />
           <PgSummaryCard title="Quick Entry" value={searchParams.get("preset")?.trim() ? "Preset" : "Manual"} subtitle="Use presets from Dashboard or enter activity directly" tone="green" />
         </div>
@@ -3801,9 +4197,11 @@ function ActivityPage() {
             value={form.patientId}
             onChange={(e) => setForm((prev) => ({ ...prev, patientId: e.target.value }))}
           >
-            <option value="">{isPgUser ? "Select Your Assigned Patient" : "Select Patient"}</option>
+            <option value="">{isPgUser ? "Select allocated patient" : "Select Patient"}</option>
             {patients.map((p) => (
-              <option key={p._id} value={p._id}>{p.patientName} ({p.ipNumber})</option>
+              <option key={p._id} value={p._id}>
+                {p.patientName} (IP {p.ipNumber}) — {p.managingPgName || "PG"} manages{p.isMine ? " · yours" : ""}
+              </option>
             ))}
           </select>
           {isPgUser ? (
@@ -3842,7 +4240,7 @@ function ActivityPage() {
         </div>
         {isPgUser ? (
           <p className="mt-3 text-xs text-slate-500">
-            Only patients currently assigned to you are shown here. Dashboard shortcuts can prefill note or review activity types.
+            All allocated inpatients are listed. Activities you log are recorded under your name, even when covering a colleague&apos;s patient.
           </p>
         ) : null}
         <textarea
@@ -3897,9 +4295,7 @@ function PGDashboardPage() {
   const navigate = useNavigate();
   const user = useSelector((s: RootState) => s.auth.user);
   const [search, setSearch] = useState("");
-  const [message, setMessage] = useState("");
-  const [busyPatientId, setBusyPatientId] = useState("");
-  const { stats, patients, todayActivities, completedCases, loading, error, refresh, reviewActivityTypeId, noteActivityTypeId } =
+  const { stats, patients, myPatients, todayActivities, todayPatientsReviewed, completedCases, loading, error, noteActivityTypeId } =
     usePgWorkspaceData(user?._id);
 
   const filteredPatients = useMemo(() => {
@@ -3913,46 +4309,27 @@ function PGDashboardPage() {
     });
   }, [patients, search]);
 
-  const handleMarkReviewed = async (row: PgWorkspacePatient) => {
-    if (!user?._id || !reviewActivityTypeId) {
-      setMessage("A review activity type is not configured yet.");
-      return;
-    }
-    setBusyPatientId(row.patientId);
-    setMessage("");
-    try {
-      await api.post("/activity", {
-        patientId: row.patientId,
-        pgId: user._id,
-        activityTypeId: reviewActivityTypeId,
-        remarks: "Quick review completed from PG dashboard.",
-      });
-      setMessage(`Review recorded for ${row.patientName}.`);
-      await refresh();
-    } catch {
-      setMessage("Could not mark the patient as reviewed right now.");
-    } finally {
-      setBusyPatientId("");
-    }
-  };
-
   return (
     <AppLayout title="PG Dashboard" subtitle="Your live clinical workspace for rounds, assigned patients, pending follow-ups, and daily activity.">
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <PgSummaryCard title="My Patients" value={patients.length} subtitle="Allocated patients under your care" tone="green" />
-        <PgSummaryCard title="Today’s Reviews" value={Number(stats.activitiesToday ?? todayActivities.length)} subtitle="Clinical activities logged in the current day" tone="green" />
+        <PgSummaryCard title="My Patients" value={myPatients.length} subtitle={`${patients.length} allocated patients visible in total`} tone="green" />
+        <PgSummaryCard
+          title="Today’s Reviews"
+          value={Number(stats.activitiesToday ?? todayPatientsReviewed)}
+          subtitle="Patients with activity today (one count per patient)"
+          tone="green"
+        />
         <PgSummaryCard title="Pending Notes" value={Number(stats.pendingTasks ?? 0)} subtitle="Progress notes still flagged as delayed" tone="orange" />
         <PgSummaryCard title="ICU Patients" value={patients.filter((row) => row.isIcu).length} subtitle="Patients needing higher-frequency follow-up" tone="red" />
       </div>
       {loading ? <div className="rounded-2xl border border-slate-200/70 bg-white/95 p-4 text-sm text-slate-500">Loading your dashboard…</div> : null}
       {error ? <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">{error}</div> : null}
-      {message ? <div className="rounded-xl border border-slate-200 bg-white/95 p-4 text-sm text-slate-600">{message}</div> : null}
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1.65fr)_minmax(320px,0.95fr)]">
         <section className="rounded-3xl border border-slate-200/80 bg-white/95 p-5 shadow-[0_10px_28px_-18px_rgba(15,23,42,0.18)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h3 className="text-lg font-semibold text-slate-900">My Allocated Patients</h3>
-              <p className="mt-1 text-sm text-slate-500">Review, document, and open timelines without leaving your duty workflow.</p>
+              <h3 className="text-lg font-semibold text-slate-900">Allocated Patients</h3>
+              <p className="mt-1 text-sm text-slate-500">All inpatients with a PG allocation — yours and colleagues'. Cover or examine any patient.</p>
             </div>
             <button type="button" className={uiBtnOutlineSm} onClick={() => navigate("/my-patients")}>
               View All
@@ -3976,14 +4353,12 @@ function PGDashboardPage() {
                 <PgPatientCard
                   key={row.patientId}
                   row={row}
-                  busy={busyPatientId === row.patientId}
                   onOpenTimeline={() => navigate(`/timeline?patient=${row.patientId}`)}
                   onAddNote={() =>
                     navigate(
                       `/activity?patient=${encodeURIComponent(row.patientId)}${noteActivityTypeId ? `&activityTypeId=${encodeURIComponent(noteActivityTypeId)}` : ""}&preset=note`,
                     )
                   }
-                  onMarkReviewed={() => void handleMarkReviewed(row)}
                 />
               ))}
             </div>
@@ -4482,146 +4857,101 @@ function OperationsDashboardPage() {
   );
 }
 
-type TimelineRefs = {
-  pgById: Record<string, string>;
-  deptById: Record<string, string>;
-  unitById: Record<string, string>;
-};
-
 function formatTimelineDate(value: unknown): string {
   if (value == null || value === "") return "—";
   const d = new Date(value as string | number | Date);
   return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
 }
 
-function shortRef(id: unknown): string {
-  if (id == null || id === "") return "—";
-  const s = String(id);
-  return s.length > 10 ? `…${s.slice(-10)}` : s;
+function formatRecommendedTimelineDate(value: unknown): string {
+  if (value == null || value === "") return "—";
+  const d = new Date(value as string | number | Date);
+  if (Number.isNaN(d.getTime())) return String(value);
+  const day = String(d.getDate()).padStart(2, "0");
+  const month = d.toLocaleString("en-GB", { month: "short" });
+  const year = d.getFullYear();
+  const time = d
+    .toLocaleString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true })
+    .replace(/\s/g, " ")
+    .trim();
+  return `${day}-${month}-${year} ${time}`;
 }
 
-function TimelineDetailRows({ rows }: { rows: Array<{ label: string; value: ReactNode }> }) {
+function TimelineNarrativeLine({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="mt-2 grid gap-x-4 gap-y-2 text-sm sm:grid-cols-[minmax(0,140px)_1fr]">
-      {rows.map((row) => (
-        <div key={row.label} className="contents">
-          <div className="text-slate-500">{row.label}</div>
-          <div className="text-slate-900">{row.value}</div>
-        </div>
-      ))}
-    </div>
+    <p className="text-sm leading-relaxed text-slate-800">
+      <span className="font-medium text-slate-900">{label}:</span> {value}
+    </p>
   );
 }
 
-function TimelineEventBody({ event, refs }: { event: { type: string; data: Record<string, unknown> }; refs: TimelineRefs }) {
+function TimelineEventBody({ event }: { event: { type: string; data: Record<string, unknown> } }) {
   const d = event.data || {};
-  const pgName = (id: unknown) => refs.pgById[String(id ?? "")] || `PG ref ${shortRef(id)}`;
 
   switch (event.type) {
     case "Admission":
       return (
-        <TimelineDetailRows
-          rows={[
-            { label: "Admission date", value: formatTimelineDate(d.admissionDate) },
-            { label: "Ward / bed", value: String(d.wardBedNumber ?? "—") },
-            { label: "Status", value: String(d.status ?? "—") },
-            {
-              label: "Department",
-              value: refs.deptById[String(d.departmentId ?? "")] || shortRef(d.departmentId),
-            },
-            {
-              label: "Unit",
-              value: refs.unitById[String(d.unitId ?? "")] || (d.unitId ? shortRef(d.unitId) : "—"),
-            },
-            ...(d.assignedPgId ? [{ label: "Assigned PG", value: pgName(d.assignedPgId) }] : []),
-          ]}
-        />
+        <div className="space-y-1">
+          <TimelineNarrativeLine label="Patient admitted to" value={String(d.departmentName ?? "—")} />
+          {d.assignedPgName ? <TimelineNarrativeLine label="Assigned PG" value={String(d.assignedPgName)} /> : null}
+        </div>
       );
-    case "Assignment":
+    case "PG Reallocation":
       return (
-        <TimelineDetailRows
-          rows={[
-            { label: "PG", value: pgName(d.pgId) },
-            { label: "Shift", value: String(d.shift ?? "—") },
-            { label: "Type", value: String(d.assignmentType ?? "—") },
-            {
-              label: "Primary",
-              value: d.isPrimary ? <span className="font-medium text-emerald-700">Yes</span> : "No",
-            },
-            {
-              label: "ICU tag",
-              value: d.icuTag ? <span className="font-medium text-amber-700">Yes</span> : "No",
-            },
-            { label: "Active", value: d.isActive === false ? "No" : "Yes" },
-            {
-              label: "Department",
-              value: refs.deptById[String(d.departmentId ?? "")] || shortRef(d.departmentId),
-            },
-            {
-              label: "Unit",
-              value: refs.unitById[String(d.unitId ?? "")] || (d.unitId ? shortRef(d.unitId) : "—"),
-            },
-            ...(d.remarks ? [{ label: "Remarks", value: String(d.remarks) }] : []),
-            { label: "Assigned at", value: formatTimelineDate(d.assignedAt) },
-          ]}
-        />
+        <div className="space-y-1">
+          <TimelineNarrativeLine label="Previous PG" value={String(d.previousPgName ?? "—")} />
+          <TimelineNarrativeLine label="New PG" value={String(d.newPgName ?? "—")} />
+          <TimelineNarrativeLine label="Reason" value={String(d.reason ?? "—")} />
+          <TimelineNarrativeLine
+            label="Changed by"
+            value={`${String(d.changedByRole ?? "Staff")}${d.changedByName && d.changedByName !== "—" ? ` (${d.changedByName})` : ""}`}
+          />
+        </div>
       );
     case "Activity":
       return (
-        <TimelineDetailRows
-          rows={[
-            { label: "Activity", value: String(d.activityType ?? "—") },
-            { label: "PG", value: pgName(d.pgId) },
-            { label: "Recorded", value: formatTimelineDate(d.createdAt) },
-            { label: "Remarks", value: String(d.remarks ?? "—") },
-          ]}
-        />
+        <div className="space-y-1">
+          <TimelineNarrativeLine label="Activity" value={String(d.activityType ?? "—")} />
+          <TimelineNarrativeLine label="PG" value={String(d.pgName ?? "—")} />
+          {d.remarks ? <TimelineNarrativeLine label="Remarks" value={String(d.remarks)} /> : null}
+        </div>
       );
     case "Procedure":
       return (
-        <TimelineDetailRows
-          rows={[
-            { label: "Procedure", value: String(d.procedureName ?? "—") },
-            { label: "Role", value: String(d.role ?? "—") },
-            { label: "Date", value: formatTimelineDate(d.date) },
-            { label: "PG", value: pgName(d.pgId) },
-          ]}
-        />
+        <div className="space-y-1">
+          <TimelineNarrativeLine label="Procedure" value={String(d.procedureName ?? "—")} />
+          <TimelineNarrativeLine label="Role" value={String(d.role ?? "—")} />
+          <TimelineNarrativeLine label="PG" value={String(d.pgName ?? "—")} />
+        </div>
       );
-    case "ProgressNote":
+    case "Progress Note":
       return (
-        <div className="mt-2 space-y-2 text-sm">
-          <TimelineDetailRows
-            rows={[
-              { label: "Note time", value: formatTimelineDate(d.noteDateTime) },
-              { label: "PG", value: pgName(d.pgId) },
-              {
-                label: "Delayed entry",
-                value: d.delayedEntry ? <span className="text-amber-700">Yes</span> : "No",
-              },
-            ]}
-          />
-          <div>
-            <p className="text-xs font-medium text-slate-500">Content</p>
-            <p className="mt-1 whitespace-pre-wrap rounded-md bg-slate-50 px-3 py-2 text-slate-800">{String(d.noteContent ?? "—")}</p>
-          </div>
+        <div className="space-y-2">
+          <TimelineNarrativeLine label="PG" value={String(d.pgName ?? "—")} />
+          {d.delayedEntry ? <p className="text-xs font-medium text-amber-700">Delayed entry</p> : null}
+          <p className="whitespace-pre-wrap rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-800">{String(d.noteContent ?? "—")}</p>
         </div>
       );
     case "Discharge":
       return (
-        <TimelineDetailRows
-          rows={[
-            { label: "Status", value: String(d.status ?? "—") },
-            { label: "Diagnosis", value: String(d.diagnosis ?? "—") },
-            { label: "Medications", value: String(d.medications ?? "—") },
-            { label: "Follow-up", value: String(d.followUpInstructions ?? "—") },
-          ]}
-        />
+        <div className="space-y-1">
+          <TimelineNarrativeLine label="Status" value={String(d.status ?? "—")} />
+          {d.diagnosis ? <TimelineNarrativeLine label="Diagnosis" value={String(d.diagnosis)} /> : null}
+          {d.medications ? <TimelineNarrativeLine label="Medications" value={String(d.medications)} /> : null}
+          {d.followUpInstructions ? <TimelineNarrativeLine label="Follow-up" value={String(d.followUpInstructions)} /> : null}
+        </div>
+      );
+    case "Assignment":
+      return (
+        <div className="space-y-1">
+          <TimelineNarrativeLine label="PG" value={String(d.pgName ?? d.pgId ?? "—")} />
+          <TimelineNarrativeLine label="Shift" value={String(d.shift ?? "—")} />
+        </div>
       );
     default:
       return (
-        <details className="mt-2 text-sm">
-          <summary className="cursor-pointer text-slate-600">Technical details</summary>
+        <details className="text-sm">
+          <summary className="cursor-pointer text-slate-600">Details</summary>
           <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded bg-slate-50 p-2 text-xs text-slate-700">
             {JSON.stringify(d, null, 2)}
           </pre>
@@ -4650,46 +4980,27 @@ function TimelinePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [eventFilter, setEventFilter] = useState("All");
-  const [refs, setRefs] = useState<TimelineRefs>({ pgById: {}, deptById: {}, unitById: {} });
   const timelineCacheRef = useRef<{ patientId: string; events: any[] } | null>(null);
   const prefetchSeqRef = useRef(0);
 
   useEffect(() => {
     const isPgUser = user?.role === "PG" && user?._id;
-    void Promise.all([
-      isPgUser ? api.get("/assignments/live-board") : api.get("/patients"),
-      api.get("/pg"),
-      api.get("/departments"),
-      api.get("/units"),
-    ])
-      .then(([patRes, pgRes, deptRes, unitRes]) => {
+    void (isPgUser ? api.get("/assignments/live-board") : api.get("/patients"))
+      .then((patRes) => {
         if (isPgUser) {
-          const rows = Array.isArray(patRes.data) ? patRes.data : [];
+          const rows = allocatedLiveBoardRows(patRes.data);
           setPatients(
-            rows
-              .filter((row: any) => Array.isArray(row.assignedPgs) && row.assignedPgs.some((pg: any) => String(pg.id) === String(user?._id)))
-              .map((row: any) => ({
-                _id: row.patientId,
-                patientName: row.patientName,
-                ipNumber: row.ipNumber,
-              })),
+            mapBoardToPgPatientOptions(rows, String(user?._id)).map((row) => ({
+              _id: row._id,
+              patientName: row.patientName,
+              ipNumber: row.ipNumber,
+              managingPgName: row.managingPgName,
+              isMine: row.isMine,
+            })),
           );
         } else {
           setPatients(patRes.data.data || []);
         }
-        const pgById: Record<string, string> = {};
-        (pgRes.data || []).forEach((u: any) => {
-          pgById[String(u._id)] = u.fullName || u.username || String(u._id);
-        });
-        const deptById: Record<string, string> = {};
-        (deptRes.data || []).forEach((x: any) => {
-          deptById[String(x._id)] = x.name || String(x._id);
-        });
-        const unitById: Record<string, string> = {};
-        (unitRes.data || []).forEach((x: any) => {
-          unitById[String(x._id)] = x.name || String(x._id);
-        });
-        setRefs({ pgById, deptById, unitById });
       })
       .catch(() => undefined);
   }, [user?._id, user?.role]);
@@ -4705,22 +5016,38 @@ function TimelinePage() {
     if (!targetId) {
       timelineCacheRef.current = null;
       setAvailableEventTypes([]);
+      setEvents([]);
+      setTimelineLoaded(false);
       return;
     }
     const seq = ++prefetchSeqRef.current;
     setPrefetchingTypes(true);
+    setLoading(true);
+    setError("");
     try {
       const { data } = await api.get(`/patient-timeline/${encodeURIComponent(targetId)}`);
       if (seq !== prefetchSeqRef.current) return;
       const payload = normalizeTimelinePayload(data);
       timelineCacheRef.current = { patientId: targetId, events: payload };
       setAvailableEventTypes(extractEventTypes(payload));
-    } catch {
+      setEvents(payload);
+      setTimelineLoaded(true);
+    } catch (err: any) {
       if (seq !== prefetchSeqRef.current) return;
       timelineCacheRef.current = null;
       setAvailableEventTypes([]);
+      setEvents([]);
+      setTimelineLoaded(false);
+      const msg =
+        typeof err?.response?.data?.message === "string"
+          ? err.response.data.message
+          : "Unable to load timeline for this patient.";
+      setError(msg);
     } finally {
-      if (seq === prefetchSeqRef.current) setPrefetchingTypes(false);
+      if (seq === prefetchSeqRef.current) {
+        setPrefetchingTypes(false);
+        setLoading(false);
+      }
     }
   };
 
@@ -4802,11 +5129,13 @@ function TimelinePage() {
     switch (type) {
       case "Admission":
         return "bg-blue-100 text-blue-800";
+      case "PG Reallocation":
+        return "bg-violet-100 text-violet-800";
       case "Assignment":
         return "bg-indigo-100 text-indigo-800";
       case "Activity":
         return "bg-emerald-100 text-emerald-800";
-      case "ProgressNote":
+      case "Progress Note":
         return "bg-amber-100 text-amber-800";
       case "Procedure":
         return "bg-cyan-100 text-cyan-800";
@@ -4821,11 +5150,13 @@ function TimelinePage() {
     switch (type) {
       case "Admission":
         return "bg-blue-500";
+      case "PG Reallocation":
+        return "bg-violet-500";
       case "Assignment":
         return "bg-indigo-500";
       case "Activity":
         return "bg-emerald-500";
-      case "ProgressNote":
+      case "Progress Note":
         return "bg-amber-500";
       case "Procedure":
         return "bg-cyan-500";
@@ -4837,7 +5168,7 @@ function TimelinePage() {
   };
 
   return (
-    <AppLayout title="Patient Timeline" subtitle="A clean chronological flow of admission, reviews, notes, procedures, and discharge events.">
+    <AppLayout title="Patient Timeline" subtitle="Chronological admission, PG reallocation, activity, and discharge events.">
       <section className="rounded-3xl border border-slate-200/70 bg-white/95 shadow-[0_6px_28px_-12px_rgba(15,23,42,0.08)] backdrop-blur-sm p-4">
         <div className="grid gap-3 lg:grid-cols-[2fr_1fr_auto]">
           <div className="min-w-0">
@@ -4850,7 +5181,7 @@ function TimelinePage() {
               <option value="">Select patient</option>
               {patients.map((p) => (
                 <option key={p._id} value={p._id}>
-                  {p.patientName} ({p.ipNumber})
+                  {p.patientName} (IP {p.ipNumber}) — {(p as { managingPgName?: string }).managingPgName || "PG"} manages
                 </option>
               ))}
             </select>
@@ -4874,9 +5205,10 @@ function TimelinePage() {
             <button
               type="button"
               onClick={() => void loadTimeline()}
-              className="w-full rounded-xl bg-gradient-to-r from-teal-700 to-teal-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-teal-900/20 transition hover:from-teal-800 hover:to-teal-700 lg:w-auto"
+              disabled={!patientId.trim() || loading}
+              className="w-full rounded-xl bg-gradient-to-r from-teal-700 to-teal-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-teal-900/20 transition hover:from-teal-800 hover:to-teal-700 disabled:opacity-50 lg:w-auto"
             >
-              Load Timeline
+              {loading ? "Loading…" : "Refresh"}
             </button>
           </div>
         </div>
@@ -4891,11 +5223,7 @@ function TimelinePage() {
       {error ? <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div> : null}
       {!loading && !error && !timelineLoaded ? (
         <div className="rounded-2xl border border-slate-200/70 bg-white/95 p-4 text-sm text-slate-500 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
-          {patientId.trim()
-            ? prefetchingTypes
-              ? "Loading event types for this patient..."
-              : "Click Load Timeline to view this patient's events."
-            : "Select a patient, then click Load Timeline."}
+          {patientId.trim() ? "Loading timeline for this patient…" : "Select a patient to view the recommended timeline."}
         </div>
       ) : null}
       {!loading && !error && timelineLoaded && filteredEvents.length === 0 ? (
@@ -4903,32 +5231,32 @@ function TimelinePage() {
           No timeline events match the current filter.
         </div>
       ) : null}
-      <div className="space-y-4">
-        {filteredEvents.map((event: any, idx: number) => {
-          const eventKind = String(event.type ?? event.eventType ?? "Unknown");
-          return (
-            <div key={`${eventKind}-${idx}`} className="grid gap-3 md:grid-cols-[110px_24px_minmax(0,1fr)]">
-              <div className="pt-2 text-xs font-medium tabular-nums text-slate-500">{formatTimelineDate(event.at)}</div>
-              <div className="relative hidden md:flex md:justify-center">
-                <span className={`relative z-10 mt-2 h-3 w-3 rounded-full ${typeMarkerClass(eventKind)}`} />
-                {idx < filteredEvents.length - 1 ? <span className="absolute top-5 h-full w-px bg-slate-200" aria-hidden /> : null}
-              </div>
-              <article className="rounded-3xl border border-slate-200/70 bg-white/95 p-4 shadow-[0_6px_24px_-14px_rgba(15,23,42,0.14)] backdrop-blur-sm">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 md:hidden">
-                    <span className={`h-2.5 w-2.5 rounded-full ${typeMarkerClass(eventKind)}`} />
-                    <span className="text-xs tabular-nums text-slate-500">{formatTimelineDate(event.at)}</span>
+      {timelineLoaded && filteredEvents.length > 0 ? (
+        <section className="rounded-3xl border border-slate-200/70 bg-white/95 p-5 shadow-[0_6px_28px_-12px_rgba(15,23,42,0.08)] backdrop-blur-sm">
+          <h3 className="text-base font-semibold text-slate-900">Recommended Timeline</h3>
+          <div className="mt-5 space-y-0">
+            {filteredEvents.map((event: any, idx: number) => {
+              const eventKind = String(event.type ?? event.eventType ?? "Unknown");
+              return (
+                <div key={`${eventKind}-${idx}-${event.at}`} className="grid gap-3 border-l-2 border-slate-200 pl-5 pb-8 last:pb-0 md:grid-cols-[180px_minmax(0,1fr)] md:gap-6">
+                  <div className="relative">
+                    <span className={`absolute -left-[1.65rem] top-1.5 h-3 w-3 rounded-full ${typeMarkerClass(eventKind)}`} />
+                    <p className="text-sm font-semibold tabular-nums text-slate-800">{formatRecommendedTimelineDate(event.at)}</p>
                   </div>
-                  <span className={`rounded-full px-2 py-0.5 text-xs font-semibold uppercase tracking-wide ${typeBadgeClass(eventKind)}`}>
-                    {eventKind}
-                  </span>
+                  <article>
+                    <h4 className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-semibold uppercase tracking-wide ${typeBadgeClass(eventKind)}`}>
+                      {eventKind}
+                    </h4>
+                    <div className="mt-3">
+                      <TimelineEventBody event={{ ...event, type: eventKind }} />
+                    </div>
+                  </article>
                 </div>
-                <TimelineEventBody event={{ ...event, type: eventKind }} refs={refs} />
-              </article>
-            </div>
-          );
-        })}
-      </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
     </AppLayout>
   );
 }
@@ -5256,7 +5584,14 @@ function UsersPage() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [submitMessage, setSubmitMessage] = useState("");
+  const [formError, setFormError] = useState("");
+  const [feedback, setFeedback] = useState<{
+    open: boolean;
+    variant: "success" | "error";
+    title: string;
+    message: string;
+  }>({ open: false, variant: "success", title: "", message: "" });
+  const [pendingDelete, setPendingDelete] = useState<{ id: string; name: string; username: string } | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [roleFilter, setRoleFilter] = useState("");
@@ -5336,13 +5671,15 @@ function UsersPage() {
   };
 
   const openCreateForm = () => {
-    setSubmitMessage("");
+    setFormError("");
+    setFeedback((prev) => ({ ...prev, open: false }));
     resetForm();
     setShowForm(true);
   };
 
   const openEditForm = (row: any) => {
-    setSubmitMessage("");
+    setFormError("");
+    setFeedback((prev) => ({ ...prev, open: false }));
     setEditingUserId(String(row._id));
     setShowForm(true);
     setForm({
@@ -5365,24 +5702,24 @@ function UsersPage() {
     const username = form.username.trim();
     const fullName = form.fullName.trim();
     if (!username || !fullName) {
-      setSubmitMessage("Username and full name are required.");
+      setFormError("Username and full name are required.");
       return;
     }
     if (!editingUserId && !form.password.trim()) {
-      setSubmitMessage("Password is required for new users.");
+      setFormError("Password is required for new users.");
       return;
     }
     if (form.password && form.password.length < 6) {
-      setSubmitMessage("Password must be at least 6 characters.");
+      setFormError("Password must be at least 6 characters.");
       return;
     }
     if (form.password && form.password !== form.confirmPassword) {
-      setSubmitMessage("Password and confirmation do not match.");
+      setFormError("Password and confirmation do not match.");
       return;
     }
 
     setSubmitting(true);
-    setSubmitMessage("");
+    setFormError("");
     try {
       const payload: Record<string, unknown> = {
         username,
@@ -5402,15 +5739,32 @@ function UsersPage() {
 
       if (editingUserId) {
         await api.put(`/users/${editingUserId}`, payload);
-        setSubmitMessage(`User "${fullName}" updated.`);
+        resetForm();
+        await loadUsers();
+        setFeedback({
+          open: true,
+          variant: "success",
+          title: "User updated successfully",
+          message: `Changes for "${fullName}" have been saved.`,
+        });
       } else {
         await api.post("/users", payload);
-        setSubmitMessage(`User "${fullName}" created.`);
+        resetForm();
+        await loadUsers();
+        setFeedback({
+          open: true,
+          variant: "success",
+          title: "User created successfully",
+          message: `Account for "${fullName}" (${username}) is ready to use.`,
+        });
       }
-      resetForm();
-      await loadUsers();
     } catch (error: any) {
-      setSubmitMessage(error?.response?.data?.message || `Could not ${editingUserId ? "update" : "create"} user.`);
+      setFeedback({
+        open: true,
+        variant: "error",
+        title: editingUserId ? "Could not update user" : "Could not create user",
+        message: error?.response?.data?.message || "Something went wrong. Please try again.",
+      });
     } finally {
       setSubmitting(false);
     }
@@ -5419,25 +5773,62 @@ function UsersPage() {
   const toggleUserStatus = async (row: any) => {
     const nextStatus = row.status === "Inactive" ? "Active" : "Inactive";
     setSubmitting(true);
-    setSubmitMessage("");
+    setFormError("");
     try {
       await api.patch(`/users/${row._id}/status`, { status: nextStatus });
-      setSubmitMessage(`${row.fullName || row.username} marked ${nextStatus}.`);
       await loadUsers();
+      setFeedback({
+        open: true,
+        variant: "success",
+        title: nextStatus === "Active" ? "User activated" : "User deactivated",
+        message: `${row.fullName || row.username} is now ${nextStatus.toLowerCase()}.`,
+      });
     } catch (error: any) {
-      setSubmitMessage(error?.response?.data?.message || "Could not update user status.");
+      setFeedback({
+        open: true,
+        variant: "error",
+        title: "Could not update status",
+        message: error?.response?.data?.message || "Something went wrong. Please try again.",
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const confirmDeleteUser = async () => {
+    if (!pendingDelete) return;
+    setSubmitting(true);
+    setFormError("");
+    try {
+      await api.delete(`/users/${pendingDelete.id}`);
+      const label = pendingDelete.name || pendingDelete.username;
+      setPendingDelete(null);
+      await loadUsers();
+      setFeedback({
+        open: true,
+        variant: "success",
+        title: "User deleted",
+        message: `"${label}" has been permanently removed.`,
+      });
+    } catch (error: any) {
+      setFeedback({
+        open: true,
+        variant: "error",
+        title: "Could not delete user",
+        message: error?.response?.data?.message || "Something went wrong. Please try again.",
+      });
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <AppLayout title="User Accounts" subtitle="Create and manage logins for Admin, HOD, Consultant, PG, and MRD roles.">
+    <AppLayout title="User Accounts" subtitle="Create and manage logins. Deactivate disables sign-in; Delete permanently removes an account.">
       <div className="rounded-2xl border border-slate-200/70 bg-white/95 p-5 shadow-[0_4px_24px_-6px_rgba(15,23,42,0.07)] backdrop-blur-sm">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 className="text-sm font-semibold text-slate-900">Account registry</h3>
-            <p className="mt-1 text-xs text-slate-500">Logged in as {user?.role || "User"}. Passwords are stored hashed.</p>
+            <p className="mt-1 text-xs text-slate-500">Logged in as {user?.role || "User"}. Deactivate blocks login; Delete removes the account permanently.</p>
           </div>
           <button type="button" className="rounded-lg bg-teal-700 px-4 py-2 text-sm font-medium text-white hover:bg-teal-800" onClick={openCreateForm}>
             Create user
@@ -5453,7 +5844,6 @@ function UsersPage() {
           </select>
         </div>
         {loadError ? <p className="mt-3 text-sm text-red-700">{loadError}</p> : null}
-        {submitMessage ? <p className="mt-3 text-sm text-slate-600">{submitMessage}</p> : null}
       </div>
 
       {showForm ? (
@@ -5502,6 +5892,7 @@ function UsersPage() {
               {submitting ? "Saving…" : editingUserId ? "Save changes" : "Create user"}
             </button>
           </div>
+          {formError ? <p className="mt-3 rounded-xl border border-red-200/80 bg-red-50/90 px-3 py-2 text-sm text-red-800">{formError}</p> : null}
         </div>
       ) : null}
 
@@ -5537,6 +5928,16 @@ function UsersPage() {
                       <button type="button" className={uiBtnOutlineSm} onClick={() => void toggleUserStatus(row)} disabled={submitting}>
                         {row.status === "Inactive" ? "Activate" : "Deactivate"}
                       </button>
+                      {String(row._id) !== String(user?._id) ? (
+                        <button
+                          type="button"
+                          className="rounded-lg border border-red-200 bg-white px-3 py-1 text-xs font-medium text-red-700 transition hover:bg-red-50 focus:outline-none focus:ring-2 focus:ring-red-500/20 disabled:opacity-50"
+                          onClick={() => setPendingDelete({ id: String(row._id), name: row.fullName || "", username: row.username || "" })}
+                          disabled={submitting}
+                        >
+                          Delete
+                        </button>
+                      ) : null}
                     </div>
                   </td>
                 </tr>
@@ -5547,6 +5948,50 @@ function UsersPage() {
         <p className={uiTableSwipeHint}>Swipe horizontally to see all columns.</p>
         {!loading && filteredUsers.length === 0 ? <p className="p-4 text-sm text-slate-500">No users match this filter.</p> : null}
       </div>
+      <FeedbackDialog
+        open={feedback.open}
+        variant={feedback.variant}
+        title={feedback.title}
+        message={feedback.message}
+        onClose={() => setFeedback((prev) => ({ ...prev, open: false }))}
+      />
+      {pendingDelete ? (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/50 p-4 pt-[12vh] backdrop-blur-[2px]"
+          role="dialog"
+          aria-modal="true"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setPendingDelete(null);
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl border border-slate-200/80 bg-white/95 p-6 shadow-[0_24px_64px_-12px_rgba(15,23,42,0.18)] backdrop-blur-xl"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-semibold tracking-tight text-slate-900">Delete user permanently?</h3>
+            <p className="mt-2 text-sm leading-relaxed text-slate-600">
+              This will permanently remove{" "}
+              <span className="font-medium text-slate-900">{pendingDelete.name || pendingDelete.username}</span> (
+              <span className="font-mono text-xs">{pendingDelete.username}</span>) and related PG activity records. This
+              cannot be undone.
+            </p>
+            <p className="mt-2 text-xs text-slate-500">Tip: use Deactivate first if you only need to block sign-in.</p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button type="button" className={uiBtnOutline} onClick={() => setPendingDelete(null)} disabled={submitting}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="rounded-xl bg-red-700 px-4 py-2 text-sm font-medium text-white hover:bg-red-800 disabled:opacity-50"
+                onClick={() => void confirmDeleteUser()}
+                disabled={submitting}
+              >
+                {submitting ? "Deleting…" : "Delete permanently"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </AppLayout>
   );
 }

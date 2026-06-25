@@ -18,11 +18,9 @@ const userSchema = new Schema(
   { timestamps: true },
 );
 
-userSchema.pre("save", async function hashPassword(next: (err?: Error) => void) {
-  const doc = this as unknown as { isModified: (field: string) => boolean; password: string };
-  if (!doc.isModified("password")) return next();
-  doc.password = await bcrypt.hash(doc.password, 10);
-  next();
+userSchema.pre("save", async function hashPassword() {
+  if (!this.isModified("password")) return;
+  this.password = await bcrypt.hash(this.password, 10);
 });
 
 const pgMasterSchema = new Schema(

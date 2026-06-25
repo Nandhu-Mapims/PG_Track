@@ -25,6 +25,7 @@ export type PatDetailsQueryOptions = {
   regno?: string;
   patname?: string;
   optoip?: "0" | "1";
+  depid?: string;
   /** When true, return Z-patient rows (for validation only — default excludes them). */
   includeZPatients?: boolean;
 };
@@ -33,12 +34,13 @@ function buildPatDetailsPrintQuery(from: Date, to: Date, options: PatDetailsQuer
   const ipno = sqlLiteral(options.ipno ?? "");
   const regno = sqlLiteral(options.regno ?? "");
   const patname = sqlLiteral(options.patname ?? "");
+  const depid = sqlLiteral(options.depid ?? "0");
   const optoip = options.optoip ?? "0";
   return (
     `Use kmch_frontoffice EXEC Fo_Rpt_IPPatdetailsprint_QB  @frmdate = '${formatReportDate(from)}' , ` +
     `@todate = '${formatReportDate(to)}' , @patname = '${patname}' , @regno = '${regno}' , @ipno = '${ipno}' , @docid = '0' , ` +
     `@MatrixFormat = '0' , @wardid = '0' , @Status = '0' , @PatType = '0' , @Corporate_type = '0' , ` +
-    `@depid = '0' , @BedId = '0' , @RegDocCity = '0' , @optoip = '${optoip}' , @ReligionId = '0' , ` +
+    `@depid = '${depid}' , @BedId = '0' , @RegDocCity = '0' , @optoip = '${optoip}' , @ReligionId = '0' , ` +
     `@RefDocDays = '0' , @VisitCategory = '' , @CorporateId = '' , @unit = '0' , @grpby = '0' `
   );
 }
@@ -53,6 +55,7 @@ export const EMR_Z_PATIENT_PAT_TYPE = "62";
 export type OpPatDetailsQueryOptions = {
   regno?: string;
   patname?: string;
+  depid?: string;
   /** SP filter; use "0" for all types, then drop ZPATIENT rows client-side. */
   patType?: string;
 };
@@ -64,13 +67,14 @@ export function buildOpPatDetailsPrintQuery(
 ): string {
   const regno = sqlLiteral(options.regno ?? "");
   const patname = sqlLiteral(options.patname ?? "");
+  const depid = sqlLiteral(options.depid ?? "0");
   const patType = sqlLiteral(options.patType ?? "0");
   return (
     `Use kmch_frontoffice Exec Fo_Rpt_OPPatdetailsprint_QB  @frmdate = '${formatReportDate(from)}' , ` +
     `@todate = '${formatReportDate(to)}' , @regno = '${regno}' , @patname = '${patname}' , @docid = '0' , ` +
     `@IncludingDirectIP = '1' , @Visittype = '0' , @PatType = '${patType}' , @MatrixFormat = '0' , ` +
     `@ReferredSource = '0' , @Type = '0' , @ClassId = '0' , @CorporateId = '0' , @Corporate_type = '0' , ` +
-    `@depid = '0' , @RefDocCity = '0' , @ReligionId = '0' , @RefDocDays = '0' , @RefDocId = '0' , @VisitCategory = '' `
+    `@depid = '${depid}' , @RefDocCity = '0' , @ReligionId = '0' , @RefDocDays = '0' , @RefDocId = '0' , @VisitCategory = '' `
   );
 }
 
@@ -184,8 +188,9 @@ export async function fetchOpPatDetailsFromEmr(
   to: Date,
   regno = "",
   patname = "",
+  depid = "0",
 ): Promise<Record<string, unknown>[]> {
-  const strQuery = buildOpPatDetailsPrintQuery(from, to, { regno, patname, patType: "0" });
+  const strQuery = buildOpPatDetailsPrintQuery(from, to, { regno, patname, patType: "0", depid });
   const rows = await fetchEmrQueryBuilderDataset(strQuery);
   return filterOutEmrZPatients(rows);
 }

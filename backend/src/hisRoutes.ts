@@ -4,6 +4,7 @@ import { hisEnv } from "./hisEnv";
 import {
   checkPatientExistsInHis,
   fetchHisDepartments,
+  fetchHisDepartmentSearchOptions,
   fetchHisPatients,
   fetchPatientDemographics,
   HisError,
@@ -71,6 +72,8 @@ export function registerHisRoutes(apiRouter: Router) {
         reg_no: String(body.reg_no ?? "").trim(),
         date_from: String(body.date_from ?? "").trim(),
         date_to: String(body.date_to ?? "").trim(),
+        dept_id: String(body.dept_id ?? "").trim(),
+        dept_name: String(body.dept_name ?? "").trim(),
         visit_type: parseVisitType(body.visit_type),
         page: Number(body.page) || 1,
         page_size: Number(body.page_size) || 50,
@@ -87,6 +90,18 @@ export function registerHisRoutes(apiRouter: Router) {
     }
     try {
       const rows = await fetchHisDepartments();
+      return res.json(rows);
+    } catch (err) {
+      return sendHisError(res, err);
+    }
+  });
+
+  apiRouter.get("/his/department-options", authMiddleware, async (_req, res) => {
+    if (!hisEnv.enabled || (!hisEnv.sqlConfigured && !hisEnv.queryBuilderConfigured)) {
+      return res.json([]);
+    }
+    try {
+      const rows = await fetchHisDepartmentSearchOptions();
       return res.json(rows);
     } catch (err) {
       return sendHisError(res, err);
